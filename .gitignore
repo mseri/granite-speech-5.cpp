@@ -1,0 +1,13 @@
+# build artifacts
+*.o
+/granite
+
+# reference oracle environment
+/.venv/
+/.uvcache/
+
+# model weights (downloaded separately)
+/granite-speech-5.0/
+
+# scratch
+*.bin
