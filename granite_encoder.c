@@ -134,28 +134,34 @@ typedef struct {
     float *mid;     /* [T, VOCAB]      mid-injection logits */
 } scratch_t;
 
+/* Every scratch buffer is an operand of a GEMM or of the attention kernel, so
+ * they are allocated through granite_device_alloc: under the Metal backend that
+ * puts them in shared storage and the GPU consumes them in place. */
 static void scratch_free(scratch_t *s) {
-    free(s->norm); free(s->ff); free(s->q); free(s->k); free(s->v);
-    free(s->attn); free(s->conv); free(s->conv_o); free(s->proj); free(s->mid);
+    granite_device_free(s->norm); granite_device_free(s->ff);
+    granite_device_free(s->q); granite_device_free(s->k);
+    granite_device_free(s->v); granite_device_free(s->attn);
+    granite_device_free(s->conv); granite_device_free(s->conv_o);
+    granite_device_free(s->proj); granite_device_free(s->mid);
     memset(s, 0, sizeof(*s));
 }
 
 static int scratch_alloc(scratch_t *s, int T) {
     memset(s, 0, sizeof(*s));
     size_t h = (size_t)T * GRANITE_HIDDEN * sizeof(float);
-    s->norm   = malloc(h);
-    s->q      = malloc(h);
-    s->k      = malloc(h);
-    s->v      = malloc(h);
-    s->attn   = malloc(h);
-    s->proj   = malloc(h);
-    s->ff     = malloc((size_t)T * FF_INNER * sizeof(float));
-    s->conv   = malloc((size_t)T * CONV_INNER * sizeof(float));
-    s->conv_o = malloc((size_t)T * CONV_INNER * sizeof(float));
+    s->norm   = granite_device_alloc(h);
+    s->q      = granite_device_alloc(h);
+    s->k      = granite_device_alloc(h);
+    s->v      = granite_device_alloc(h);
+    s->attn   = granite_device_alloc(h);
+    s->proj   = granite_device_alloc(h);
+    s->ff     = granite_device_alloc((size_t)T * FF_INNER * sizeof(float));
+    s->conv   = granite_device_alloc((size_t)T * CONV_INNER * sizeof(float));
+    s->conv_o = granite_device_alloc((size_t)T * CONV_INNER * sizeof(float));
     /* Mid-injection runs at layer 8, well past both subsampling blocks, so it
      * only ever sees T/4 frames. Sizing this at T would reserve 4x the largest
      * buffer in the model (T * 16384 floats). */
-    s->mid    = malloc(((size_t)(T / 4) + 2) * GRANITE_VOCAB * sizeof(float));
+    s->mid    = granite_device_alloc(((size_t)(T / 4) + 2) * GRANITE_VOCAB * sizeof(float));
     if (!s->norm || !s->q || !s->k || !s->v || !s->attn || !s->proj ||
         !s->ff || !s->conv || !s->conv_o || !s->mid) {
         scratch_free(s);
@@ -258,7 +264,7 @@ float *granite_encode(const granite_model_t *m, const float *feats,
     scratch_t s;
     if (scratch_alloc(&s, T) != 0) return NULL;
 
-    float *x = malloc((size_t)T * GRANITE_HIDDEN * sizeof(float));
+    float *x = granite_device_alloc((size_t)T * GRANITE_HIDDEN * sizeof(float));
     if (!x) { scratch_free(&s); return NULL; }
 
     granite_linear_bf16(x, feats, m->w.input_linear_w, m->w.input_linear_b,
@@ -307,15 +313,21 @@ float *granite_encode(const granite_model_t *m, const float *feats,
         }
     }
 
-    float *logits = malloc((size_t)T * GRANITE_VOCAB * sizeof(float));
+    /* Device-allocated, so the CTC head GEMM writes straight into it. Callers
+     * release this with granite_logits_free, not free(). */
+    float *logits = granite_device_alloc((size_t)T * GRANITE_VOCAB * sizeof(float));
     if (logits)
         granite_linear_bf16(logits, x, m->w.out_w, m->w.out_b,
                             T, GRANITE_HIDDEN, GRANITE_VOCAB);
 
-    free(x);
+    granite_device_free(x);
     scratch_free(&s);
     *out_frames = T;
     return logits;
+}
+
+void granite_logits_free(float *logits) {
+    granite_device_free(logits);
 }
 
 int granite_ctc_greedy(const float *logits, int n_frames, int vocab, int *out_ids) {

@@ -7,6 +7,10 @@
 #include "granite_kernels.h"
 #include "granite_tokenizer.h"
 
+#ifdef USE_MPS
+#include "granite_kernels_metal.h"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,7 +81,7 @@ static char *transcribe_and_dump(granite_model_t *m, const float *samples,
         free(ids);
     }
     free(feats);
-    free(logits);
+    granite_logits_free(logits);
     return text;
 }
 
@@ -150,6 +154,12 @@ int main(int argc, char **argv) {
     }
 
     granite_set_threads(threads > 0 ? threads : granite_get_num_cpus());
+
+#ifdef USE_MPS
+    /* Keep the stderr contract: nothing extra by default, the device name only
+     * under --debug, and silence under --silent. Must precede granite_load. */
+    granite_metal_set_verbose(silent ? 0 : (debug ? 2 : 1));
+#endif
 
     double t0 = now_sec();
     granite_model_t *m = granite_load(model_dir, debug);

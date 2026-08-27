@@ -34,6 +34,33 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef USE_MPS
+#include "granite_kernels_metal.h"
+#endif
+
+/* ========================================================================
+ * Allocation
+ *
+ * Under Metal these are shared (CPU+GPU) buffers, which is what keeps the
+ * 1.8 GB weight cache from being duplicated on the device: the GPU reads the
+ * exact bytes the bf16 -> f32 conversion wrote.
+ * ======================================================================== */
+
+void *granite_device_alloc(size_t bytes) {
+#ifdef USE_MPS
+    void *p = granite_metal_alloc(bytes);
+    if (p) return p;
+#endif
+    return malloc(bytes);
+}
+
+void granite_device_free(void *p) {
+#ifdef USE_MPS
+    if (granite_metal_dealloc(p)) return;
+#endif
+    free(p);
+}
+
 /* ========================================================================
  * Thread pool (adapted from qwen-asr)
  * ======================================================================== */
@@ -243,7 +270,7 @@ static const float *bf16_as_f32(const uint16_t *src, size_t n) {
     }
     size_t bytes = n * sizeof(float);
     if (wcache.count < WCACHE_MAX_ENTRIES && wcache.used + bytes <= wcache.limit) {
-        float *buf = malloc(bytes);
+        float *buf = granite_device_alloc(bytes);
         if (buf) {
             bf16_to_f32_buf(buf, src, n);
             wcache.entries[wcache.count].src = src;
@@ -259,8 +286,8 @@ static const float *bf16_as_f32(const uint16_t *src, size_t n) {
      * Valid until the next uncached conversion, which is enough because callers
      * consume the pointer within a single kernel invocation. */
     if (scratch_n < n) {
-        free(scratch);
-        scratch = malloc(bytes);
+        granite_device_free(scratch);
+        scratch = granite_device_alloc(bytes);
         scratch_n = scratch ? n : 0;
     }
     const float *out = scratch;
@@ -324,6 +351,14 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
         for (int o = 0; o < out_dim; o++) bias[o] = granite_bf16_to_f32(b[o]);
     }
 
+#ifdef USE_MPS
+    /* Falls through to the CPU path if the shape is too small to be worth a
+     * dispatch, or if an operand could not be resolved to a device buffer. */
+    if (granite_metal_should_offload(seq, in_dim, out_dim) &&
+        granite_metal_linear(y, x, Wf, bias, seq, in_dim, out_dim))
+        goto done;
+#endif
+
 #ifdef USE_BLAS
     if (bias) {
         for (int i = 0; i < seq; i++)
@@ -338,6 +373,9 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
     parallel_for(linear_worker, &args);
 #endif
 
+#ifdef USE_MPS
+done:
+#endif
     if (bias && bias != bias_stack) free(bias);
 }
 
@@ -574,6 +612,12 @@ void granite_block_attention(float *out, const float *q, const float *k,
     int n_pos = 2 * GRANITE_MAX_POS_EMB + 1;
     const float *rel = bf16_as_f32(rel_pos_emb, (size_t)n_pos * dim_head);
     if (!rel) return;
+
+#ifdef USE_MPS
+    if (granite_metal_block_attention(out, q, k, v, seq, block_len, heads,
+                                      dim_head, scale, rel, n_pos, dists, ctx))
+        return;
+#endif
 
     attn_args_t args = {
         out, q, k, v, seq / block_len, block_len, heads, dim_head,

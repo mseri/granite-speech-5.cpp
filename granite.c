@@ -293,12 +293,12 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
             int cap = raw_cap ? raw_cap : 1024;
             while (base + enc_frames > cap) cap *= 2;
             int *nr = realloc(raw, (size_t)cap * sizeof(int));
-            if (!nr) { free(logits); break; }
+            if (!nr) { granite_logits_free(logits); break; }
             raw = nr;
             raw_cap = cap;
         }
         argmax_frames(logits, enc_frames, ids);
-        free(logits);
+        granite_logits_free(logits);
         /* Only write frames that are not yet committed. The window overlaps
          * already-committed frames and re-decodes them under different context;
          * letting those results land would mutate the committed prefix, so the
@@ -376,9 +376,9 @@ char *granite_transcribe(granite_model_t *m, const float *samples, int n_samples
     if (!logits) return NULL;
 
     int *ids = malloc((size_t)out_frames * sizeof(int));
-    if (!ids) { free(logits); return NULL; }
+    if (!ids) { granite_logits_free(logits); return NULL; }
     int n_ids = granite_ctc_greedy(logits, out_frames, GRANITE_VOCAB, ids);
-    free(logits);
+    granite_logits_free(logits);
 
     if (m->verbose)
         fprintf(stderr, "granite: %d encoder frames -> %d tokens\n",

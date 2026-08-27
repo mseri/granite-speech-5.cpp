@@ -25,6 +25,17 @@ void granite_set_weight_cache_limit(size_t bytes);
 /* Bytes currently held by the bf16 -> f32 weight cache. */
 size_t granite_weight_cache_bytes(void);
 
+/* ------------------------------------------------------------- allocation --- */
+
+/* Allocate a buffer for weights or activations. Under the Metal backend this
+ * comes from GPU-visible shared memory, so kernels read the same bytes the CPU
+ * wrote and no operand is ever uploaded; otherwise it is plain malloc.
+ *
+ * Buffers obtained here MUST be released with granite_device_free, not free().
+ * granite_device_free(NULL) is a no-op. */
+void *granite_device_alloc(size_t bytes);
+void granite_device_free(void *p);
+
 /* ---------------------------------------------------------------- basics --- */
 
 void granite_add_inplace(float *a, const float *b, int n);

@@ -10,7 +10,12 @@ Companion to [`qwen-asr`](../qwen-asr), which does the same for Qwen3-ASR.
 
 ```sh
 make blas          # Accelerate on macOS, OpenBLAS on Linux
+make mps           # Metal/MPS on Apple Silicon
 ```
+
+`mps` is a superset of `blas`: it keeps BLAS for the shapes too small to be
+worth a GPU dispatch, and falls back to it wholesale if no Metal device is
+available. See [Backends](#backends).
 
 ## Run
 
@@ -168,6 +173,31 @@ Peak RSS is ~2.4 GB by default, dominated by the bf16→f32 weight cache;
 Neither `-S` nor `--stream` reduces peak RSS meaningfully (measured 3.0 GB
 whole-clip vs 3.1 GB segmented on 30 minutes) — the weights dominate.
 
+## Backends
+
+| | `make blas` | `make mps` |
+| --- | --- | --- |
+| Linears | `cblas_sgemm` | `MPSMatrixMultiplication` |
+| Block attention | NEON + thread pool | Metal compute shader |
+| Norms, GLU, SiLU, depthwise conv | CPU | CPU |
+| Platforms | macOS, Linux | macOS on Apple Silicon |
+
+The MPS backend allocates the weight cache and every encoder scratch buffer as
+Metal *shared* buffers, so the GPU reads the same bytes the CPU wrote. Operands
+are never uploaded per call and the 1.8 GB weight cache is not duplicated on the
+device, so peak RSS is roughly unchanged from the BLAS build.
+
+Norms and elementwise ops stay on the CPU deliberately — each would cost a
+dispatch round-trip to save very little. Under `--debug` the backend reports the
+device it selected:
+
+```
+$ ./granite -d granite-speech-5.0 -i audio.wav --debug
+[metal] using device: Apple M2 Pro
+```
+
+If that line is absent on an `mps` build, the run went to BLAS.
+
 ## Layout
 
 | File | Contents |
@@ -176,6 +206,7 @@ whole-clip vs 3.1 GB segmented on 30 minutes) — the weights dominate.
 | `granite.c` | model load/free, end-to-end transcription |
 | `granite_encoder.c` | conformer forward pass, weight binding |
 | `granite_kernels.c` | thread pool, bf16 GEMM, norms, attention, conv |
+| `granite_kernels_metal.m` | Metal backend: shared buffers, MPS GEMM, attention shader |
 | `granite_audio.c` | WAV I/O, FFT, mel filterbank, front-end |
 | `granite_tokenizer.c` | decode-only BPE (CTC never encodes text) |
 | `granite_safetensors.c` | mmap'd checkpoint reader (from `qwen-asr`) |

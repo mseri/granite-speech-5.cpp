@@ -185,6 +185,11 @@ float *granite_encode(const granite_model_t *m, const float *feats,
                       int n_frames, int *out_frames);
 int granite_ctc_greedy(const float *logits, int n_frames, int vocab, int *out_ids);
 
+/* Release a buffer returned by granite_encode. Not interchangeable with free():
+ * under the Metal backend the logits live in GPU-visible shared storage so the
+ * CTC head GEMM can write them in place. */
+void granite_logits_free(float *logits);
+
 /* Resolve every weight pointer into the mmap'd checkpoint. Returns 0 on
  * success, -1 if any tensor is missing or has an unexpected dtype. */
 int granite_bind_weights(granite_weights_t *w, const multi_safetensors_t *ms);
