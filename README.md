@@ -30,6 +30,31 @@ Audio can also come from stdin, as either a WAV stream or raw s16le 16 kHz mono:
 cat audio.wav | ./granite -d granite-speech-5.0 --stdin
 ```
 
+### Streaming
+
+`--stream` decodes incrementally, printing text as it stabilizes:
+
+```sh
+arecord -f S16_LE -r 16000 -c 1 | ./granite -d granite-speech-5.0 --stream
+```
+
+It re-encodes a sliding window and commits only frames that are settled, so
+emitted text is never retracted. Output starts once ~10 s of audio has arrived
+(see *Chunked decoding* below) and then follows with ~1.6 s of latency.
+
+### Segmented
+
+`-S <secs>` decodes long files in independent pieces, moving each cut to the
+quietest point within `-W` seconds so boundaries land in pauses:
+
+```sh
+./granite -d granite-speech-5.0 -i lecture.wav -S 30
+```
+
+This avoids a single huge logits allocation (one contiguous
+`frames × 16384` float buffer, ~1.4 GB per 30 minutes). It does **not** lower
+peak RSS — the weight cache dominates that.
+
 ### Options
 
 | Flag | Meaning |
@@ -37,6 +62,12 @@ cat audio.wav | ./granite -d granite-speech-5.0 --stdin
 | `-d, --model-dir DIR` | directory with `model.safetensors` + `tokenizer.json` |
 | `-i, --input FILE` | 16-bit PCM WAV to transcribe |
 | `--stdin` | read WAV or raw s16le 16 kHz mono from stdin |
+| `-S, --segment SECS` | segmented decode (0 = whole clip, the default) |
+| `-W, --cut-window SECS` | search radius for a segment cut (default 3.0) |
+| `--stream` | incremental decode; implies `--stdin` |
+| `--stream-chunk SECS` | audio between decodes (default 2.0) |
+| `--stream-window SECS` | context re-encoded per decode (default 20.5) |
+| `--stream-lookahead SECS` | audio withheld from commit (default 1.6) |
 | `-t, --threads N` | worker threads (default: CPU count) |
 | `--silent` | quiet stderr; the transcription still goes to stdout |
 | `--debug` | verbose diagnostics, weight-cache and peak-RSS report |
@@ -91,6 +122,34 @@ than the 128-frame context, and odd frame counts hitting the subsampling trim:
 Features match to ~1e-5 and logits to ~1e-4; argmax agrees on **100% of frames**
 in every case, which is what actually determines the transcript.
 
+## Chunked decoding
+
+Attention is block-local over 128 encoder frames, and a frame is 80 ms, so the
+model's effective receptive field is **one attention block ≈ 10.2 s**. Measured
+directly: perturbing 10 ms of audio changes logits across exactly frames 0–127
+of its block, and only weakly beyond. Everything about chunking follows from
+that number.
+
+- Segments below 10.2 s are clamped up to it.
+- Streaming windows start on **block boundaries**. Aligning only to frames
+  shifts the whole block grid between windows and was worth ~1.8% WER.
+- Nothing is committed until a full block of audio exists; before that the
+  window's right edge is padding rather than signal.
+
+Cost of chunking, measured against the whole-clip decode:
+
+| Audio | `-S 30` | `--stream` |
+| --- | --- | --- |
+| 11s / 3.6s samples | 0.00% | 0.00% |
+| 119s real speech | 2.21% | 0.44% |
+| 10 min | — | 0.61% |
+
+Streaming tracks offline more closely than segmented because it re-decodes
+overlapping context and commits only settled frames, where segmented decodes
+disjoint pieces and concatenates. Against *ground truth* on the 119 s sample all
+three modes are equivalent (offline 18.1%, stream and segment 17.2%), so
+chunking costs no real accuracy.
+
 ## Performance
 
 Apple Silicon, `make blas`, 8 threads, model file warm in the page cache:
@@ -102,8 +161,12 @@ Apple Silicon, `make blas`, 8 threads, model file warm in the page cache:
 | 66s | 2.24s | 0.034 |
 
 Roughly 9–29× realtime, improving with clip length as fixed costs amortize.
-Peak RSS is ~2.4 GB by default; `--weight-cache 0` drops that to ~1.3 GB by
-reconverting weights per call instead of holding them as f32.
+A 10-minute file decodes in ~20 s (RTF 0.033).
+
+Peak RSS is ~2.4 GB by default, dominated by the bf16→f32 weight cache;
+`--weight-cache 0` drops that to ~1.3 GB by reconverting weights per call.
+Neither `-S` nor `--stream` reduces peak RSS meaningfully (measured 3.0 GB
+whole-clip vs 3.1 GB segmented on 30 minutes) — the weights dominate.
 
 ## Layout
 
@@ -118,6 +181,7 @@ reconverting weights per call instead of holding them as f32.
 | `granite_safetensors.c` | mmap'd checkpoint reader (from `qwen-asr`) |
 | `reference.py` | PyTorch parity oracle |
 | `test_granite.py` | regression + parity harness |
+| `tools/stream_wer.py` | WER of a chunked mode against the offline decode |
 
 ## License
 

@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "granite_audio.h"
 #include "granite_safetensors.h"
 
 /* ========================================================================
@@ -120,9 +121,58 @@ typedef struct {
 granite_model_t *granite_load(const char *model_dir, int verbose);
 void granite_free(granite_model_t *m);
 
+/* ========================================================================
+ * Runtime parameters
+ * ======================================================================== */
+
+/* Attention is block-local over GRANITE_CONTEXT_SIZE encoder frames, and an
+ * encoder frame is 80 ms, so one attention block spans ~10.2 s. That is the
+ * model's effective receptive field and the floor for any chunk length: cutting
+ * below it degrades accuracy, which is why the minimums here are what they are. */
+#define GRANITE_BLOCK_SECONDS \
+    ((float)GRANITE_CONTEXT_SIZE * GRANITE_SAMPLES_PER_FRAME / GRANITE_SAMPLE_RATE)
+
+typedef struct {
+    /* Segmented mode: 0 decodes the whole clip in one pass. */
+    float segment_sec;
+    float cut_window_sec;        /* silence search radius around a boundary */
+
+    /* Streaming mode. */
+    float stream_chunk_sec;      /* audio accumulated between decodes */
+    float stream_window_sec;     /* longest context re-encoded per decode */
+    float stream_lookahead_sec;  /* trailing audio withheld from commit */
+} granite_params_t;
+
+void granite_default_params(granite_params_t *p);
+
+/* Called with each newly committed piece of text as decoding progresses.
+ * `delta` is the text appended since the previous call. */
+typedef void (*granite_text_cb)(const char *delta, void *user);
+
 /* Transcribe mono 16 kHz float samples in [-1, 1].
  * Returns a malloc'd UTF-8 string the caller must free, or NULL on error. */
 char *granite_transcribe(granite_model_t *m, const float *samples, int n_samples);
+
+/* Segmented transcription: split the audio at low-energy points near each
+ * nominal boundary and decode the pieces independently.
+ *
+ * This bounds the size of individual allocations -- a whole-clip decode needs
+ * one contiguous n_frames * 16384 float buffer for the logits, which is ~1.4 GB
+ * per 30 minutes and can simply fail to allocate. It does NOT meaningfully
+ * lower peak RSS: the bf16 -> f32 weight cache dominates that (measured 3.0 GB
+ * whole-clip vs 3.1 GB segmented on 30 minutes of audio).
+ *
+ * With p->segment_sec == 0 this is exactly granite_transcribe. */
+char *granite_transcribe_segmented(granite_model_t *m, const float *samples,
+                                   int n_samples, const granite_params_t *p,
+                                   granite_text_cb cb, void *user);
+
+/* Streaming transcription from a live source. Re-encodes a sliding window as
+ * audio arrives and commits frames older than the lookahead, so committed text
+ * never changes retroactively. Returns the full transcript. */
+char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
+                                const granite_params_t *p,
+                                granite_text_cb cb, void *user);
 
 /* Lower-level pieces, exposed for the parity harness (tools/parity.c).
  *

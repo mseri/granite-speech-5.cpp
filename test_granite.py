@@ -142,6 +142,68 @@ def run_case(binary, model_dir, wav, expected, tmp, label):
     return ok
 
 
+def wer(ref, hyp):
+    """Word-level Levenshtein distance."""
+    r, h = ref.split(), hyp.split()
+    prev = list(range(len(h) + 1))
+    for i in range(1, len(r) + 1):
+        cur = [i] + [0] * len(h)
+        for j in range(1, len(h) + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1,
+                         prev[j - 1] + (r[i - 1] != h[j - 1]))
+        prev = cur
+    return prev[len(h)], len(r)
+
+
+def run_mode_cases(binary, model_dir):
+    """Segmented and streaming must track the whole-clip decode closely.
+
+    Offline is the reference, so this measures the cost of chunking, not model
+    quality. Both modes re-decode overlapping context, so exact equality is not
+    expected on real speech; the budget is deliberately tight enough that a
+    regression in the commit logic (which historically produced duplicated
+    word fragments) will trip it.
+    """
+    # Budgets are (segment, stream). Streaming re-decodes overlapping context
+    # and commits only settled frames, so it tracks offline far more closely
+    # than segmented mode, which decodes disjoint pieces and concatenates.
+    # Clips shorter than one attention block must match offline exactly: they
+    # fit in a single window, so there is no seam for either mode to get wrong.
+    cases = []
+    long_wav = os.path.join(HERE, "..", "qwen-asr", "samples",
+                            "night_of_the_living_dead_1968",
+                            "119s_theres_supposed_to_be_another_broadcast.wav")
+    if os.path.exists(long_wav):
+        cases.append(("119s", long_wav, {"segment": 0.03, "stream": 0.01}))
+    for rel, _ in SAMPLES:
+        wav = os.path.join(HERE, rel)
+        if os.path.exists(wav):
+            cases.append((os.path.basename(rel), wav,
+                          {"segment": 0.0, "stream": 0.0}))
+
+    ok = True
+    for label, wav, budgets in cases:
+        ref = subprocess.run([binary, "-d", model_dir, "-i", wav, "--silent"],
+                             capture_output=True, text=True).stdout.strip()
+
+        seg = subprocess.run([binary, "-d", model_dir, "-i", wav, "-S", "30",
+                              "--silent"], capture_output=True, text=True).stdout.strip()
+        with open(wav, "rb") as f:
+            stream = subprocess.run([binary, "-d", model_dir, "--stream", "--silent"],
+                                    input=f.read(), capture_output=True).stdout.decode().strip()
+
+        for mode, hyp in (("segment", seg), ("stream", stream)):
+            budget = budgets[mode]
+            errs, n = wer(ref, hyp)
+            rate = errs / max(n, 1)
+            status = "PASS" if rate <= budget else "FAIL"
+            print(f"  {status} {label} {mode}: {errs}/{n} words differ from "
+                  f"offline ({100 * rate:.2f}%, budget {100 * budget:.0f}%)")
+            if rate > budget:
+                ok = False
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", default=os.path.join(HERE, "granite"))
@@ -180,6 +242,9 @@ def main():
             wav = os.path.join(tmp, f"syn_{label}.wav")
             make_synthetic(wav, n_samples)
             all_ok &= run_case(args.binary, args.model_dir, wav, None, tmp, label)
+
+    print("\nSegmented / streaming vs offline:")
+    all_ok &= run_mode_cases(args.binary, args.model_dir)
 
     print("\nAll checks passed." if all_ok else "\nFAILURES above.")
     return 0 if all_ok else 1

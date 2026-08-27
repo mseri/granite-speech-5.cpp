@@ -152,7 +152,10 @@ static int scratch_alloc(scratch_t *s, int T) {
     s->ff     = malloc((size_t)T * FF_INNER * sizeof(float));
     s->conv   = malloc((size_t)T * CONV_INNER * sizeof(float));
     s->conv_o = malloc((size_t)T * CONV_INNER * sizeof(float));
-    s->mid    = malloc((size_t)T * GRANITE_VOCAB * sizeof(float));
+    /* Mid-injection runs at layer 8, well past both subsampling blocks, so it
+     * only ever sees T/4 frames. Sizing this at T would reserve 4x the largest
+     * buffer in the model (T * 16384 floats). */
+    s->mid    = malloc(((size_t)(T / 4) + 2) * GRANITE_VOCAB * sizeof(float));
     if (!s->norm || !s->q || !s->k || !s->v || !s->attn || !s->proj ||
         !s->ff || !s->conv || !s->conv_o || !s->mid) {
         scratch_free(s);

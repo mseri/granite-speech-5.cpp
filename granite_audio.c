@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -174,6 +175,180 @@ float *granite_read_stdin(int *out_n_samples) {
     }
     free(buf);
     return out;
+}
+
+/* ========================================================================
+ * Live audio (stdin reader thread)
+ * ======================================================================== */
+
+struct granite_live_audio {
+    float *buf;
+    int len, cap;
+    int eof;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+};
+
+static void live_append(granite_live_audio_t *la, const float *src, int n) {
+    pthread_mutex_lock(&la->mutex);
+    if (la->len + n > la->cap) {
+        while (la->len + n > la->cap) la->cap = la->cap ? la->cap * 2 : 1 << 18;
+        la->buf = realloc(la->buf, (size_t)la->cap * sizeof(float));
+    }
+    if (la->buf) {
+        memcpy(la->buf + la->len, src, (size_t)n * sizeof(float));
+        la->len += n;
+    }
+    pthread_cond_broadcast(&la->cond);
+    pthread_mutex_unlock(&la->mutex);
+}
+
+/* Read exactly n bytes, or fewer at end of stream. */
+static size_t read_full(uint8_t *dst, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        size_t r = fread(dst + got, 1, n - got, stdin);
+        if (r == 0) break;
+        got += r;
+    }
+    return got;
+}
+
+/* Consume a WAV header from stdin, leaving the stream positioned at the first
+ * audio byte. Returns 0 if this was not a WAV (in which case `lead`/`lead_n`
+ * hold the bytes already consumed, which are raw audio).
+ *
+ * Chunk layouts vary: real files put LIST or multi-kilobyte FLLR padding
+ * chunks between `fmt ` and `data`, so the data offset cannot be assumed. */
+static int consume_wav_header(uint8_t *lead, size_t *lead_n) {
+    uint8_t riff[12];
+    size_t got = read_full(riff, sizeof(riff));
+    if (got < 12 || memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
+        memcpy(lead, riff, got);
+        *lead_n = got;
+        return 0;
+    }
+
+    for (;;) {
+        uint8_t ch[8];
+        if (read_full(ch, 8) < 8) break;
+        uint32_t clen = rd_u32(ch + 4);
+
+        if (memcmp(ch, "data", 4) == 0) break;   /* audio starts here */
+
+        if (memcmp(ch, "fmt ", 4) == 0 && clen >= 16) {
+            uint8_t fmt[64];
+            uint32_t take = clen < sizeof(fmt) ? clen : (uint32_t)sizeof(fmt);
+            if (read_full(fmt, take) < take) break;
+            int rate = (int)rd_u32(fmt + 4);
+            int bits = rd_u16(fmt + 14);
+            int channels = rd_u16(fmt + 2);
+            if (rate != GRANITE_SAMPLE_RATE || bits != 16 || channels != 1)
+                fprintf(stderr, "granite: --stream expects 16 kHz mono 16-bit "
+                                "(got %d Hz, %d-bit, %d ch)\n", rate, bits, channels);
+            clen -= take;
+        }
+        /* Skip the remainder of this chunk (chunks are word-aligned). */
+        uint32_t skip = clen + (clen & 1);
+        uint8_t sink[4096];
+        while (skip > 0) {
+            uint32_t take = skip < sizeof(sink) ? skip : (uint32_t)sizeof(sink);
+            if (read_full(sink, take) < take) return 1;
+            skip -= take;
+        }
+    }
+    *lead_n = 0;
+    return 1;
+}
+
+static void *live_reader(void *arg) {
+    granite_live_audio_t *la = arg;
+
+    /* A WAV header is consumed if present; anything else is raw s16le. */
+    uint8_t lead[12];
+    size_t lead_n = 0;
+    consume_wav_header(lead, &lead_n);
+    if (lead_n >= 2) {
+        int n = (int)(lead_n / 2);
+        float tmp[6];
+        for (int i = 0; i < n; i++)
+            tmp[i] = (float)(int16_t)rd_u16(lead + (size_t)i * 2) / 32768.0f;
+        live_append(la, tmp, n);
+    }
+
+    uint8_t chunk[8192];
+    float conv[4096];
+    int carry_valid = 0;
+    uint8_t carry = 0;
+    for (;;) {
+        size_t r = fread(chunk, 1, sizeof(chunk), stdin);
+        if (r == 0) break;
+
+        size_t off = 0;
+        int n = 0;
+        /* A read can split a 16-bit sample; carry the odd byte over. */
+        if (carry_valid) {
+            uint8_t pair[2] = { carry, chunk[0] };
+            conv[n++] = (float)(int16_t)rd_u16(pair) / 32768.0f;
+            off = 1;
+            carry_valid = 0;
+        }
+        for (; off + 2 <= r; off += 2) {
+            conv[n++] = (float)(int16_t)rd_u16(chunk + off) / 32768.0f;
+            if (n == (int)(sizeof(conv) / sizeof(conv[0]))) {
+                live_append(la, conv, n);
+                n = 0;
+            }
+        }
+        if (off < r) { carry = chunk[off]; carry_valid = 1; }
+        if (n > 0) live_append(la, conv, n);
+    }
+
+    pthread_mutex_lock(&la->mutex);
+    la->eof = 1;
+    pthread_cond_broadcast(&la->cond);
+    pthread_mutex_unlock(&la->mutex);
+    return NULL;
+}
+
+granite_live_audio_t *granite_live_audio_start_stdin(void) {
+    granite_live_audio_t *la = calloc(1, sizeof(*la));
+    if (!la) return NULL;
+    pthread_mutex_init(&la->mutex, NULL);
+    pthread_cond_init(&la->cond, NULL);
+    if (pthread_create(&la->thread, NULL, live_reader, la) != 0) {
+        free(la);
+        return NULL;
+    }
+    return la;
+}
+
+void granite_live_audio_free(granite_live_audio_t *la) {
+    if (!la) return;
+    pthread_join(la->thread, NULL);
+    pthread_mutex_destroy(&la->mutex);
+    pthread_cond_destroy(&la->cond);
+    free(la->buf);
+    free(la);
+}
+
+int granite_live_audio_wait(granite_live_audio_t *la, int want, int *eof) {
+    pthread_mutex_lock(&la->mutex);
+    while (la->len < want && !la->eof)
+        pthread_cond_wait(&la->cond, &la->mutex);
+    int len = la->len;
+    if (eof) *eof = la->eof;
+    pthread_mutex_unlock(&la->mutex);
+    return len;
+}
+
+void granite_live_audio_copy(granite_live_audio_t *la, int start, int n, float *dst) {
+    pthread_mutex_lock(&la->mutex);
+    if (start < 0) start = 0;
+    if (start + n > la->len) n = la->len - start;
+    if (n > 0) memcpy(dst, la->buf + start, (size_t)n * sizeof(float));
+    pthread_mutex_unlock(&la->mutex);
 }
 
 /* ========================================================================
