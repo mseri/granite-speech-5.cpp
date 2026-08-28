@@ -184,8 +184,7 @@ static void feed_forward(float *x, int T, scratch_t *s,
     granite_silu(s->ff, T * FF_INNER);
     granite_linear_bf16(s->proj, s->ff, l2w, l2b, T, FF_INNER, GRANITE_HIDDEN);
 
-    int n = T * GRANITE_HIDDEN;
-    for (int i = 0; i < n; i++) x[i] += 0.5f * s->proj[i];
+    granite_add_scaled_inplace(x, s->proj, 0.5f, T * GRANITE_HIDDEN);
 }
 
 /* x += Attention(x). Full blocks of CONTEXT_SIZE, then a trailing block at its
@@ -219,8 +218,7 @@ static void attention(float *x, int T, scratch_t *s, const granite_layer_t *L,
 
     granite_linear_bf16(s->proj, s->attn, L->o_w, L->o_b, T, inner, GRANITE_HIDDEN);
 
-    int n = T * GRANITE_HIDDEN;
-    for (int i = 0; i < n; i++) x[i] += s->proj[i];
+    granite_add_inplace(x, s->proj, T * GRANITE_HIDDEN);
 }
 
 /* Conv module. Writes the module output to s->proj and returns its frame count
@@ -280,16 +278,12 @@ float *granite_encode(const granite_model_t *m, const float *feats,
         int conv_T = conv_module(x, T, &s, L);
         if (L->subsample) {
             /* Mean-pool the residual to half rate (dropping a trailing odd
-             * frame) and trim the conv output to match. */
+             * frame) and trim the conv output to match. The pool is threaded
+             * and so cannot write back into x; it lands in s.norm (dead at this
+             * point, and the same T * HIDDEN shape) and the two swap roles. */
             int t_half = T / 2;
-            for (int t = 0; t < t_half; t++) {
-                float *dst = x + (size_t)t * GRANITE_HIDDEN;
-                const float *a = x + (size_t)(2 * t) * GRANITE_HIDDEN;
-                const float *b = a + GRANITE_HIDDEN;
-                const float *c = s.proj + (size_t)t * GRANITE_HIDDEN;
-                for (int j = 0; j < GRANITE_HIDDEN; j++)
-                    dst[j] = 0.5f * (a[j] + b[j]) + c[j];
-            }
+            granite_subsample_pool_add(s.norm, x, s.proj, t_half, GRANITE_HIDDEN);
+            float *tmp = x; x = s.norm; s.norm = tmp;
             T = t_half;
             (void)conv_T;
         } else {

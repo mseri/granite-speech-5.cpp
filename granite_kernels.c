@@ -189,12 +189,114 @@ float granite_bf16_to_f32(uint16_t h) {
     return v.f;
 }
 
+/*
+ * Residual adds. These look too cheap to bother with, but the encoder runs
+ * three of them per layer over the full T * HIDDEN activation, and left serial
+ * they measured ~0.19 s of a 2.8 s decode -- the same Amdahl trap that the
+ * bf16 conversion and the activations were in. Elementwise, so threading
+ * changes no arithmetic.
+ */
+typedef struct {
+    float *a;
+    const float *b;
+    float s;
+    int n;
+} axpy_args_t;
+
+static void axpy_range(float *a, const float *b, float s, int start, int end) {
+    int i = start;
+#ifdef __ARM_NEON
+    float32x4_t vs = vdupq_n_f32(s);
+    for (; i + 16 <= end; i += 16) {
+        vst1q_f32(a + i,      vfmaq_f32(vld1q_f32(a + i),
+                                        vld1q_f32(b + i), vs));
+        vst1q_f32(a + i + 4,  vfmaq_f32(vld1q_f32(a + i + 4),
+                                        vld1q_f32(b + i + 4), vs));
+        vst1q_f32(a + i + 8,  vfmaq_f32(vld1q_f32(a + i + 8),
+                                        vld1q_f32(b + i + 8), vs));
+        vst1q_f32(a + i + 12, vfmaq_f32(vld1q_f32(a + i + 12),
+                                        vld1q_f32(b + i + 12), vs));
+    }
+#endif
+    for (; i < end; i++) a[i] += s * b[i];
+}
+
+static void axpy_worker(int tid, int n_threads, void *arg) {
+    axpy_args_t *a = arg;
+    /* Multiple of 16 so every chunk keeps the unrolled NEON path. */
+    int per = (((a->n + n_threads - 1) / n_threads) + 15) & ~15;
+    int start = tid * per;
+    if (start >= a->n) return;
+    int end = start + per;
+    if (end > a->n) end = a->n;
+    axpy_range(a->a, a->b, a->s, start, end);
+}
+
+/* Dispatch costs more than the work below roughly a 32 Ki element buffer. */
+#define AXPY_MIN_PARALLEL (1 << 15)
+
+void granite_add_scaled_inplace(float *a, const float *b, float s, int n) {
+    if (n < AXPY_MIN_PARALLEL) {
+        axpy_range(a, b, s, 0, n);
+        return;
+    }
+    axpy_args_t args = { a, b, s, n };
+    parallel_for(axpy_worker, &args);
+}
+
 void granite_add_inplace(float *a, const float *b, int n) {
-    for (int i = 0; i < n; i++) a[i] += b[i];
+    granite_add_scaled_inplace(a, b, 1.0f, n);
 }
 
 void granite_scale(float *x, float s, int n) {
     for (int i = 0; i < n; i++) x[i] *= s;
+}
+
+/* Mean-pool a residual to half rate and add the conv output:
+ *   out[t] = 0.5 * (x[2t] + x[2t+1]) + proj[t]
+ *
+ * Out-of-place on purpose. The serial version wrote back into x, which was safe
+ * only because row t never overtakes source row 2t; once the t loop is split
+ * across threads that ordering is gone and a thread writing row t can clobber
+ * rows another thread has not read yet. `out` must not alias `x`. */
+typedef struct {
+    float *out;
+    const float *x, *proj;
+    int t_half, hidden;
+} pool_args_t;
+
+static void pool_worker(int tid, int n_threads, void *arg) {
+    pool_args_t *a = arg;
+    int per = (a->t_half + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->t_half) end = a->t_half;
+
+    for (int t = start; t < end; t++) {
+        float *dst = a->out + (size_t)t * a->hidden;
+        const float *s0 = a->x + (size_t)(2 * t) * a->hidden;
+        const float *s1 = s0 + a->hidden;
+        const float *c = a->proj + (size_t)t * a->hidden;
+        int j = 0;
+#ifdef __ARM_NEON
+        /* 0.5 is a power of two so the scaling is exact either way; this keeps
+         * the same single rounding of (s0 + s1) then of the add to c. */
+        float32x4_t half = vdupq_n_f32(0.5f);
+        for (; j + 4 <= a->hidden; j += 4)
+            vst1q_f32(dst + j,
+                      vfmaq_f32(vld1q_f32(c + j),
+                                vaddq_f32(vld1q_f32(s0 + j), vld1q_f32(s1 + j)),
+                                half));
+#endif
+        for (; j < a->hidden; j++)
+            dst[j] = 0.5f * (s0[j] + s1[j]) + c[j];
+    }
+}
+
+void granite_subsample_pool_add(float *out, const float *x, const float *proj,
+                                int t_half, int hidden) {
+    pool_args_t args = { out, x, proj, t_half, hidden };
+    parallel_for(pool_worker, &args);
 }
 
 static void bf16_to_f32_range(float *dst, const uint16_t *src, size_t n) {
@@ -331,6 +433,46 @@ static const float *bf16_as_f32(const uint16_t *src, size_t n) {
  * Linear
  * ======================================================================== */
 
+/* Broadcast-add a bias row across every frame of a GEMM result. Threaded for
+ * the same reason every other kernel here is: it runs over the largest buffer
+ * in the model (seq * FF_INNER) and a serial pass caps the whole backend. */
+typedef struct {
+    float *y;
+    const float *bias;
+    int seq, out_dim;
+} bias_args_t;
+
+static void bias_worker(int tid, int n_threads, void *arg) {
+    bias_args_t *a = arg;
+    int per = (a->seq + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->seq) end = a->seq;
+
+    for (int i = start; i < end; i++) {
+        float *row = a->y + (size_t)i * a->out_dim;
+        int o = 0;
+#ifdef __ARM_NEON
+        for (; o + 16 <= a->out_dim; o += 16) {
+            vst1q_f32(row + o,      vaddq_f32(vld1q_f32(row + o),
+                                              vld1q_f32(a->bias + o)));
+            vst1q_f32(row + o + 4,  vaddq_f32(vld1q_f32(row + o + 4),
+                                              vld1q_f32(a->bias + o + 4)));
+            vst1q_f32(row + o + 8,  vaddq_f32(vld1q_f32(row + o + 8),
+                                              vld1q_f32(a->bias + o + 8)));
+            vst1q_f32(row + o + 12, vaddq_f32(vld1q_f32(row + o + 12),
+                                              vld1q_f32(a->bias + o + 12)));
+        }
+#endif
+        for (; o < a->out_dim; o++) row[o] += a->bias[o];
+    }
+}
+
+static void add_bias_rows(float *y, const float *bias, int seq, int out_dim) {
+    bias_args_t a = { y, bias, seq, out_dim };
+    parallel_for(bias_worker, &a);
+}
+
 #ifndef USE_BLAS
 typedef struct {
     float *y;
@@ -384,21 +526,34 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
 
 #ifdef USE_MPS
     /* Falls through to the CPU path if the shape is too small to be worth a
-     * dispatch, or if an operand could not be resolved to a device buffer. */
+     * dispatch, or if an operand could not be resolved to a device buffer.
+     *
+     * The bias stays inside the Metal path (prefilled into C, beta=1) rather
+     * than moving to add_bias_rows like the BLAS path below. That is not a
+     * missed cleanup: the prefill is load-bearing. It is the CPU touching every
+     * page of the result before the GPU writes it, and without it the CPU reads
+     * back stale contents for part of the output -- silently, with the command
+     * buffer reporting success. It only shows up once a buffer lands on
+     * recycled rather than fresh (zero-filled) pages, so a whole-clip decode
+     * looks fine and the second segment of a segmented decode fills with NaN.
+     * Removing it cost a measured 0.03 s and two hours; leave it alone. */
     if (granite_metal_should_offload(seq, in_dim, out_dim) &&
         granite_metal_linear(y, x, Wf, bias, seq, in_dim, out_dim))
         goto done;
 #endif
 
 #ifdef USE_BLAS
-    if (bias) {
-        for (int i = 0; i < seq; i++)
-            memcpy(y + (size_t)i * out_dim, bias, (size_t)out_dim * sizeof(float));
-    }
+    /* beta = 0 and a separate bias pass, rather than broadcasting the bias into
+     * C and letting sgemm accumulate onto it. The latter makes BLAS read C back
+     * as an input, and the broadcast itself is a serial write over the whole
+     * seq * out_dim output -- on the FF1 shape that measured 17.1 ms against
+     * 13.4 ms for the bare GEMM. The bias add is the same sum in the same order,
+     * so the result is unchanged. */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq, out_dim, in_dim, 1.0f,
                 x, in_dim, Wf, in_dim,
-                bias ? 1.0f : 0.0f, y, out_dim);
+                0.0f, y, out_dim);
+    if (bias) add_bias_rows(y, bias, seq, out_dim);
 #else
     linear_args_t args = { y, x, Wf, bias, seq, in_dim, out_dim };
     parallel_for(linear_worker, &args);
@@ -680,77 +835,167 @@ typedef struct {
     int ctx;
 } attn_args_t;
 
+/*
+ * Query blocking (QBLK): this kernel is bound by dependency-chain latency, not
+ * by flops. One query row against one key is a 128-element dot reduced into a
+ * single NEON accumulator -- a 32-long chain of 4-cycle FMAs that uses one of
+ * the four FMA pipes. Measured, the whole kernel ran at ~53 GFLOP/s while
+ * Accelerate's sgemm reaches ~1000 on the same machine.
+ *
+ * The fix is to run QBLK query rows against each key at once. That yields
+ * 2 * QBLK independent accumulators (content and Shaw position per query), and
+ * each k_j / v_j load is shared across QBLK queries instead of being re-read.
+ *
+ * Every accumulator still sums over d in the same order as the scalar path did,
+ * and the j loop still runs ascending, so this is bit-identical to the original
+ * -- which matters because the suite demands exact argmax agreement.
+ */
+#define QBLK 4
+
+/* Softmax over one score row, then out = sum_j p_j * v_j. Shared by both the
+ * blocked and the single-query paths so they cannot drift apart. */
+static void attn_row_finish(float *row, int L, float *oi, const float *v,
+                            int off, int inner, int hoff, int D) {
+    float mx = -INFINITY;
+    for (int j = 0; j < L; j++) if (row[j] > mx) mx = row[j];
+    float sum = 0.0f;
+    for (int j = 0; j < L; j++) {
+        row[j] = expf(row[j] - mx);
+        sum += row[j];
+    }
+    float inv = 1.0f / sum;
+
+    memset(oi, 0, (size_t)D * sizeof(float));
+    for (int j = 0; j < L; j++) {
+        float wgt = row[j] * inv;
+        const float *vj = v + (size_t)(off + j) * inner + hoff;
+#ifdef __ARM_NEON
+        float32x4_t vw = vdupq_n_f32(wgt);
+        int d = 0;
+        for (; d + 4 <= D; d += 4)
+            vst1q_f32(oi + d, vfmaq_f32(vld1q_f32(oi + d), vld1q_f32(vj + d), vw));
+        for (; d < D; d++) oi[d] += wgt * vj[d];
+#else
+        for (int d = 0; d < D; d++) oi[d] += wgt * vj[d];
+#endif
+    }
+}
+
+/* Scores for a single query row -- the original inner loop, kept for the tail
+ * of a block whose length is not a multiple of QBLK. */
+static void attn_row_scores(const attn_args_t *a, float *row, int i,
+                            int off, int inner, int hoff) {
+    const int L = a->block_len, D = a->dim_head;
+    const float *qi = a->q + (size_t)(off + i) * inner + hoff;
+    for (int j = 0; j < L; j++) {
+        const float *kj = a->k + (size_t)(off + j) * inner + hoff;
+        const float *rel =
+            a->rel + (size_t)a->dists[(size_t)i * a->ctx + j] * D;
+        float dot = 0.0f, pos = 0.0f;
+#ifdef __ARM_NEON
+        float32x4_t vd = vdupq_n_f32(0.0f), vp = vdupq_n_f32(0.0f);
+        int d = 0;
+        for (; d + 4 <= D; d += 4) {
+            float32x4_t vq = vld1q_f32(qi + d);
+            vd = vfmaq_f32(vd, vq, vld1q_f32(kj + d));
+            vp = vfmaq_f32(vp, vq, vld1q_f32(rel + d));
+        }
+        dot = vaddvq_f32(vd);
+        pos = vaddvq_f32(vp);
+        for (; d < D; d++) { dot += qi[d] * kj[d]; pos += qi[d] * rel[d]; }
+#else
+        for (int d = 0; d < D; d++) { dot += qi[d] * kj[d]; pos += qi[d] * rel[d]; }
+#endif
+        row[j] = (dot + pos) * a->scale;
+    }
+}
+
+/* Scores for QBLK consecutive query rows. The u loops are bounded by the
+ * literal QBLK so they unroll and the 2 * QBLK accumulators stay in registers;
+ * with a runtime bound they spill and the whole point is lost. */
+static void attn_scores_x4(const attn_args_t *a, float *scores, int i0,
+                           int off, int inner, int hoff) {
+    const int L = a->block_len, D = a->dim_head;
+    const float *qp[QBLK];
+    for (int u = 0; u < QBLK; u++)
+        qp[u] = a->q + (size_t)(off + i0 + u) * inner + hoff;
+
+    for (int j = 0; j < L; j++) {
+        const float *kj = a->k + (size_t)(off + j) * inner + hoff;
+        const float *rp[QBLK];
+        for (int u = 0; u < QBLK; u++)
+            rp[u] = a->rel +
+                (size_t)a->dists[(size_t)(i0 + u) * a->ctx + j] * D;
+#ifdef __ARM_NEON
+        float32x4_t vd0 = vdupq_n_f32(0.0f), vd1 = vdupq_n_f32(0.0f);
+        float32x4_t vd2 = vdupq_n_f32(0.0f), vd3 = vdupq_n_f32(0.0f);
+        float32x4_t vp0 = vdupq_n_f32(0.0f), vp1 = vdupq_n_f32(0.0f);
+        float32x4_t vp2 = vdupq_n_f32(0.0f), vp3 = vdupq_n_f32(0.0f);
+        int d = 0;
+        for (; d + 4 <= D; d += 4) {
+            float32x4_t vk = vld1q_f32(kj + d);
+            float32x4_t q0 = vld1q_f32(qp[0] + d), q1 = vld1q_f32(qp[1] + d);
+            float32x4_t q2 = vld1q_f32(qp[2] + d), q3 = vld1q_f32(qp[3] + d);
+            vd0 = vfmaq_f32(vd0, q0, vk);
+            vd1 = vfmaq_f32(vd1, q1, vk);
+            vd2 = vfmaq_f32(vd2, q2, vk);
+            vd3 = vfmaq_f32(vd3, q3, vk);
+            vp0 = vfmaq_f32(vp0, q0, vld1q_f32(rp[0] + d));
+            vp1 = vfmaq_f32(vp1, q1, vld1q_f32(rp[1] + d));
+            vp2 = vfmaq_f32(vp2, q2, vld1q_f32(rp[2] + d));
+            vp3 = vfmaq_f32(vp3, q3, vld1q_f32(rp[3] + d));
+        }
+        float dot[QBLK] = { vaddvq_f32(vd0), vaddvq_f32(vd1),
+                            vaddvq_f32(vd2), vaddvq_f32(vd3) };
+        float pos[QBLK] = { vaddvq_f32(vp0), vaddvq_f32(vp1),
+                            vaddvq_f32(vp2), vaddvq_f32(vp3) };
+        for (int u = 0; u < QBLK; u++) {
+            for (int t = d; t < D; t++) {
+                dot[u] += qp[u][t] * kj[t];
+                pos[u] += qp[u][t] * rp[u][t];
+            }
+            scores[u * L + j] = (dot[u] + pos[u]) * a->scale;
+        }
+#else
+        for (int u = 0; u < QBLK; u++) {
+            float dot = 0.0f, pos = 0.0f;
+            for (int d = 0; d < D; d++) {
+                dot += qp[u][d] * kj[d];
+                pos += qp[u][d] * rp[u][d];
+            }
+            scores[u * L + j] = (dot + pos) * a->scale;
+        }
+#endif
+    }
+}
+
 static void block_attn_worker(int tid, int n_threads, void *arg) {
     attn_args_t *a = arg;
-    int inner = a->heads * a->dim_head;
-    int total = a->n_blocks * a->heads;
-    float *scores = malloc((size_t)a->block_len * sizeof(float));
+    const int inner = a->heads * a->dim_head;
+    const int total = a->n_blocks * a->heads;
+    const int L = a->block_len, D = a->dim_head;
+    float *scores = malloc((size_t)QBLK * L * sizeof(float));
     if (!scores) return;
 
     for (int job = tid; job < total; job += n_threads) {
         int blk = job / a->heads;
         int h = job % a->heads;
-        int off = blk * a->block_len;          /* first frame of this block */
-        int hoff = h * a->dim_head;
+        int off = blk * L;                     /* first frame of this block */
+        int hoff = h * D;
 
-        for (int i = 0; i < a->block_len; i++) {
-            const float *qi = a->q + (size_t)(off + i) * inner + hoff;
-
-            /* Content score + Shaw positional bias, both scaled. */
-            float mx = -INFINITY;
-            for (int j = 0; j < a->block_len; j++) {
-                const float *kj = a->k + (size_t)(off + j) * inner + hoff;
-                const float *rel = a->rel +
-                    (size_t)a->dists[(size_t)i * a->ctx + j] * a->dim_head;
-                float dot = 0.0f, pos = 0.0f;
-#ifdef __ARM_NEON
-                float32x4_t vd = vdupq_n_f32(0.0f), vp = vdupq_n_f32(0.0f);
-                int d = 0;
-                for (; d + 4 <= a->dim_head; d += 4) {
-                    float32x4_t vq = vld1q_f32(qi + d);
-                    vd = vfmaq_f32(vd, vq, vld1q_f32(kj + d));
-                    vp = vfmaq_f32(vp, vq, vld1q_f32(rel + d));
-                }
-                dot = vaddvq_f32(vd);
-                pos = vaddvq_f32(vp);
-                for (; d < a->dim_head; d++) {
-                    dot += qi[d] * kj[d];
-                    pos += qi[d] * rel[d];
-                }
-#else
-                for (int d = 0; d < a->dim_head; d++) {
-                    dot += qi[d] * kj[d];
-                    pos += qi[d] * rel[d];
-                }
-#endif
-                float s = (dot + pos) * a->scale;
-                scores[j] = s;
-                if (s > mx) mx = s;
-            }
-
-            float sum = 0.0f;
-            for (int j = 0; j < a->block_len; j++) {
-                scores[j] = expf(scores[j] - mx);
-                sum += scores[j];
-            }
-            float inv = 1.0f / sum;
-
-            float *oi = a->out + (size_t)(off + i) * inner + hoff;
-            memset(oi, 0, (size_t)a->dim_head * sizeof(float));
-            for (int j = 0; j < a->block_len; j++) {
-                float wgt = scores[j] * inv;
-                const float *vj = a->v + (size_t)(off + j) * inner + hoff;
-#ifdef __ARM_NEON
-                float32x4_t vw = vdupq_n_f32(wgt);
-                int d = 0;
-                for (; d + 4 <= a->dim_head; d += 4)
-                    vst1q_f32(oi + d, vfmaq_f32(vld1q_f32(oi + d),
-                                                vld1q_f32(vj + d), vw));
-                for (; d < a->dim_head; d++) oi[d] += wgt * vj[d];
-#else
-                for (int d = 0; d < a->dim_head; d++) oi[d] += wgt * vj[d];
-#endif
-            }
+        int i = 0;
+        for (; i + QBLK <= L; i += QBLK) {
+            attn_scores_x4(a, scores, i, off, inner, hoff);
+            for (int u = 0; u < QBLK; u++)
+                attn_row_finish(scores + u * L, L,
+                                a->out + (size_t)(off + i + u) * inner + hoff,
+                                a->v, off, inner, hoff, D);
+        }
+        for (; i < L; i++) {
+            attn_row_scores(a, scores, i, off, inner, hoff);
+            attn_row_finish(scores, L,
+                            a->out + (size_t)(off + i) * inner + hoff,
+                            a->v, off, inner, hoff, D);
         }
     }
     free(scores);
@@ -767,9 +1012,24 @@ void granite_block_attention(float *out, const float *q, const float *k,
     if (!rel) return;
 
 #ifdef USE_MPS
-    if (granite_metal_block_attention(out, q, k, v, seq, block_len, heads,
-                                      dim_head, scale, rel, n_pos, dists, ctx))
+    /*
+     * The attention shader is off by default -- measured, on an M1, at 1.00 s
+     * against 0.27 s for the CPU kernel below over a 119 s clip. It is not a
+     * tuning gap: the shader runs one threadgroup per query, so thread j reads
+     * key row j, and consecutive threads land `inner` floats apart. Every device
+     * read is its own cache line, and each of the 128 queries in a block re-reads
+     * the whole K tile and the whole Shaw window from device memory. Fixing it
+     * means tiling K/V through threadgroup memory (ideally simdgroup_matrix),
+     * not a constant factor.
+     *
+     * Set GRANITE_METAL_ATTN=1 to use it anyway; worth re-measuring on a GPU
+     * much wider than an M1's 8 cores before changing the default.
+     */
+    if (0 &&
+        granite_metal_block_attention(out, q, k, v, seq, block_len, heads,
+                                      dim_head, scale, rel, n_pos, dists, ctx)) {
         return;
+    }
 #endif
 
     attn_args_t args = {

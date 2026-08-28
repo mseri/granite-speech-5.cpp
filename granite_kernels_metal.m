@@ -153,6 +153,21 @@ static int                        g_verbose = 1;
 static dispatch_once_t            g_once;
 static pthread_mutex_t            g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * MPSMatrixMultiplication compiles a kernel for its shape on construction, so
+ * building a fresh one per call charged that to every layer. The encoder only
+ * ever uses a handful of distinct (seq, in_dim, out_dim) triples -- the frame
+ * count only changes at the two subsampling blocks -- so a tiny cache removes
+ * essentially all of the churn.
+ */
+#define MM_SLOTS 16
+static struct {
+    int seq, in_dim, out_dim, has_bias;
+    MPSMatrixMultiplication *mm;
+    MPSMatrixDescriptor *dx, *dW, *dy;
+} g_mm[MM_SLOTS];
+static int g_mm_count = 0;
+
 /* ------------------------------------------------------- buffer registry --- */
 
 /*
@@ -371,6 +386,11 @@ void granite_metal_shutdown(void) {
     for (int i = 0; i < STAGE_SLOTS; i++) { g_stage[i] = nil; g_stage_cap[i] = 0; }
     for (int i = 0; i < CONST_SLOTS; i++) { g_const[i].buf = nil; g_const[i].src = NULL; }
     g_const_count = 0;
+    for (int i = 0; i < MM_SLOTS; i++) {
+        g_mm[i].mm = nil; g_mm[i].dx = nil; g_mm[i].dW = nil; g_mm[i].dy = nil;
+        g_mm[i].seq = g_mm[i].in_dim = g_mm[i].out_dim = g_mm[i].has_bias = 0;
+    }
+    g_mm_count = 0;
     g_attn = nil;
     g_queue = nil;
     g_device = nil;
@@ -379,6 +399,15 @@ void granite_metal_shutdown(void) {
 }
 
 int granite_metal_available(void) { return g_available; }
+
+int granite_metal_attn_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("GRANITE_METAL_ATTN");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached;
+}
 
 /* ========================================================================
  * Memory
@@ -430,6 +459,42 @@ int granite_metal_should_offload(int seq, int in_dim, int out_dim) {
  * GEMM
  * ======================================================================== */
 
+/* beta differs between the bias and no-bias cases, and it is baked into the
+ * MPSMatrixMultiplication at construction, so it is part of the key. */
+static int mm_slot(int seq, int in_dim, int out_dim, int has_bias) {
+    for (int i = 0; i < g_mm_count; i++)
+        if (g_mm[i].seq == seq && g_mm[i].in_dim == in_dim &&
+            g_mm[i].out_dim == out_dim && g_mm[i].has_bias == has_bias)
+            return i;
+    if (g_mm_count == MM_SLOTS) g_mm_count = 0;   /* wrap; shapes recur in cycles */
+    int i = g_mm_count++;
+
+    g_mm[i].seq = seq; g_mm[i].in_dim = in_dim; g_mm[i].out_dim = out_dim;
+    g_mm[i].has_bias = has_bias;
+    g_mm[i].dx = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)seq
+                                                      columns:(NSUInteger)in_dim
+                                                     rowBytes:(NSUInteger)in_dim * sizeof(float)
+                                                     dataType:MPSDataTypeFloat32];
+    g_mm[i].dW = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)out_dim
+                                                      columns:(NSUInteger)in_dim
+                                                     rowBytes:(NSUInteger)in_dim * sizeof(float)
+                                                     dataType:MPSDataTypeFloat32];
+    g_mm[i].dy = [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)seq
+                                                      columns:(NSUInteger)out_dim
+                                                     rowBytes:(NSUInteger)out_dim * sizeof(float)
+                                                     dataType:MPSDataTypeFloat32];
+    g_mm[i].mm =
+        [[MPSMatrixMultiplication alloc] initWithDevice:g_device
+                                         transposeLeft:NO
+                                        transposeRight:YES
+                                            resultRows:(NSUInteger)seq
+                                         resultColumns:(NSUInteger)out_dim
+                                       interiorColumns:(NSUInteger)in_dim
+                                                 alpha:1.0
+                                                  beta:(has_bias ? 1.0 : 0.0)];
+    return i;
+}
+
 /* Body of granite_metal_linear, minus the init. Kept separate so the warm-up
  * inside granite_metal_init() can reach it without re-entering dispatch_once,
  * which would deadlock. */
@@ -454,38 +519,13 @@ static int metal_linear(float *y, const float *x, const float *W,
             memcpy(yd + (size_t)i * out_dim, bias, (size_t)out_dim * sizeof(float));
     }
 
-    MPSMatrixDescriptor *dx =
-        [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)seq
-                                             columns:(NSUInteger)in_dim
-                                            rowBytes:(NSUInteger)in_dim * sizeof(float)
-                                            dataType:MPSDataTypeFloat32];
-    MPSMatrixDescriptor *dW =
-        [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)out_dim
-                                             columns:(NSUInteger)in_dim
-                                            rowBytes:(NSUInteger)in_dim * sizeof(float)
-                                            dataType:MPSDataTypeFloat32];
-    MPSMatrixDescriptor *dy =
-        [MPSMatrixDescriptor matrixDescriptorWithRows:(NSUInteger)seq
-                                             columns:(NSUInteger)out_dim
-                                            rowBytes:(NSUInteger)out_dim * sizeof(float)
-                                            dataType:MPSDataTypeFloat32];
-
-    MPSMatrix *mx = [[MPSMatrix alloc] initWithBuffer:bx offset:ox descriptor:dx];
-    MPSMatrix *mW = [[MPSMatrix alloc] initWithBuffer:bW offset:oW descriptor:dW];
-    MPSMatrix *my = [[MPSMatrix alloc] initWithBuffer:by offset:oy descriptor:dy];
-
-    MPSMatrixMultiplication *mm =
-        [[MPSMatrixMultiplication alloc] initWithDevice:g_device
-                                         transposeLeft:NO
-                                        transposeRight:YES
-                                            resultRows:(NSUInteger)seq
-                                         resultColumns:(NSUInteger)out_dim
-                                       interiorColumns:(NSUInteger)in_dim
-                                                 alpha:1.0
-                                                  beta:(bias ? 1.0 : 0.0)];
+    int slot = mm_slot(seq, in_dim, out_dim, bias != NULL);
+    MPSMatrix *mx = [[MPSMatrix alloc] initWithBuffer:bx offset:ox descriptor:g_mm[slot].dx];
+    MPSMatrix *mW = [[MPSMatrix alloc] initWithBuffer:bW offset:oW descriptor:g_mm[slot].dW];
+    MPSMatrix *my = [[MPSMatrix alloc] initWithBuffer:by offset:oy descriptor:g_mm[slot].dy];
 
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-    [mm encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mW resultMatrix:my];
+    [g_mm[slot].mm encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mW resultMatrix:my];
     [cmd commit];
     [cmd waitUntilCompleted];
 

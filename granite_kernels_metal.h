@@ -81,6 +81,12 @@ int granite_metal_dealloc(void *p);
  * matrices lose to dispatch latency even on unified memory. */
 int granite_metal_should_offload(int seq, int in_dim, int out_dim);
 
+/* 1 when granite_metal_block_attention should be preferred over the CPU kernel.
+ * Off unless GRANITE_METAL_ATTN is set to something other than 0: on an M1 the
+ * shader measured 1.00 s against the CPU kernel's 0.27 s over a 119 s clip.
+ * See the comment at the call site in granite_kernels.c. */
+int granite_metal_attn_enabled(void);
+
 /* -------------------------------------------------------------------- gemm -- */
 
 /*

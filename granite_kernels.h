@@ -42,6 +42,16 @@ void granite_add_inplace(float *a, const float *b, int n);
 void granite_scale(float *x, float s, int n);
 float granite_bf16_to_f32(uint16_t h);
 
+/* a += s * b. Threaded above ~32 Ki elements; the encoder's per-layer residual
+ * adds run over the whole T * HIDDEN activation and are not cheap enough to
+ * leave on one thread. */
+void granite_add_scaled_inplace(float *a, const float *b, float s, int n);
+
+/* Subsampling residual: out[t] = 0.5 * (x[2t] + x[2t+1]) + proj[t], for
+ * t in [0, t_half). `out` must not alias `x`. */
+void granite_subsample_pool_add(float *out, const float *x, const float *proj,
+                                int t_half, int hidden);
+
 /* ---------------------------------------------------------------- linear --- */
 
 /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out]. `b` may be NULL. */
