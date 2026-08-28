@@ -298,9 +298,11 @@ float *granite_encode(const granite_model_t *m, const float *feats,
 
         feed_forward(x, T, &s, L->norm_ff2_w, L->norm_ff2_b,
                      L->ff2_l1_w, L->ff2_l1_b, L->ff2_l2_w, L->ff2_l2_b);
-        granite_layer_norm_bf16(s.norm, x, L->norm_out_w, L->norm_out_b,
+        /* Safe in place: the mean and variance loops finish before any store,
+         * and the affine loop reads and writes the same index. Saves copying
+         * T * HIDDEN floats back out of scratch on every layer. */
+        granite_layer_norm_bf16(x, x, L->norm_out_w, L->norm_out_b,
                                 T, GRANITE_HIDDEN, LN_EPS);
-        memcpy(x, s.norm, (size_t)T * GRANITE_HIDDEN * sizeof(float));
 
         /* Mid-injection after block num_layers/2 (1-based index). */
         if (i + 1 == GRANITE_NUM_LAYERS / 2) {

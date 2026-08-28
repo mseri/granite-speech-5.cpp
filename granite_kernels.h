@@ -50,7 +50,7 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
 
 /* ------------------------------------------------------------------ norm --- */
 
-/* LayerNorm over the last dim, with bf16 affine params. */
+/* LayerNorm over the last dim, with bf16 affine params. `out` may alias `x`. */
 void granite_layer_norm_bf16(float *out, const float *x, const uint16_t *w,
                              const uint16_t *b, int seq, int hidden, float eps);
 

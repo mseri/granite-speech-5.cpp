@@ -185,7 +185,19 @@ whole-clip vs 3.1 GB segmented on 30 minutes) — the weights dominate.
 The MPS backend allocates the weight cache and every encoder scratch buffer as
 Metal *shared* buffers, so the GPU reads the same bytes the CPU wrote. Operands
 are never uploaded per call and the 1.8 GB weight cache is not duplicated on the
-device, so peak RSS is roughly unchanged from the BLAS build.
+device — that is the point of the design, and without it the device would need
+its own second copy.
+
+It still costs some memory, measured on an M1:
+
+| Peak RSS | 11s clip | 119s clip |
+| --- | --- | --- |
+| `make blas` | 2242 MB | 2506 MB |
+| `make mps` | 2767 MB | 2690 MB |
+
+The ~180–525 MB overhead is per-buffer page rounding across the ~390 weight
+allocations, MPS internal workspaces, and the staging slots. Do not describe the
+MPS build as memory-neutral; it is not.
 
 Norms and elementwise ops stay on the CPU deliberately — each would cost a
 dispatch round-trip to save very little. Under `--debug` the backend reports the

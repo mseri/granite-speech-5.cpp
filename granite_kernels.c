@@ -197,7 +197,7 @@ void granite_scale(float *x, float s, int n) {
     for (int i = 0; i < n; i++) x[i] *= s;
 }
 
-static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
+static void bf16_to_f32_range(float *dst, const uint16_t *src, size_t n) {
     size_t i = 0;
 #ifdef __ARM_NEON
     for (; i + 8 <= n; i += 8) {
@@ -209,6 +209,37 @@ static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     }
 #endif
     for (; i < n; i++) dst[i] = granite_bf16_to_f32(src[i]);
+}
+
+/* Converting the whole checkpoint writes ~1.9 GB of f32. Left on one thread it
+ * was the single largest entry in the profile (~39% of all CPU work) and, being
+ * serial, it capped what either backend could win. */
+typedef struct {
+    float *dst;
+    const uint16_t *src;
+    size_t n;
+} conv_args_t;
+
+static void conv_worker(int tid, int n_threads, void *arg) {
+    conv_args_t *a = arg;
+    /* Split on a multiple of 8 so each chunk keeps the NEON fast path. */
+    size_t per = ((a->n + n_threads - 1) / n_threads + 7) & ~(size_t)7;
+    size_t start = (size_t)tid * per;
+    if (start >= a->n) return;
+    size_t end = start + per;
+    if (end > a->n) end = a->n;
+    bf16_to_f32_range(a->dst + start, a->src + start, end - start);
+}
+
+static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
+    /* Biases and LayerNorm affines are tiny; dispatching them costs more than
+     * converting them. */
+    if (n < (1u << 16)) {
+        bf16_to_f32_range(dst, src, n);
+        return;
+    }
+    conv_args_t a = { dst, src, n };
+    parallel_for(conv_worker, &a);
 }
 
 /* ========================================================================
@@ -434,6 +465,26 @@ void granite_layer_norm_bf16(float *out, const float *x, const uint16_t *w,
     parallel_for(layer_norm_worker, &args);
 }
 
+typedef struct {
+    float *x;
+    const float *scale, *shift;
+    int seq, channels;
+} bn_args_t;
+
+static void bn_worker(int tid, int n_threads, void *arg) {
+    bn_args_t *a = arg;
+    int per = (a->seq + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->seq) end = a->seq;
+
+    for (int t = start; t < end; t++) {
+        float *xt = a->x + (size_t)t * a->channels;
+        for (int c = 0; c < a->channels; c++)
+            xt[c] = xt[c] * a->scale[c] + a->shift[c];
+    }
+}
+
 void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
                              const float *mean, const float *var,
                              int seq, int channels, float eps) {
@@ -448,10 +499,8 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
         scale[c] = g * inv;
         shift[c] = granite_bf16_to_f32(b[c]) - mean[c] * scale[c];
     }
-    for (int t = 0; t < seq; t++) {
-        float *xt = x + (size_t)t * channels;
-        for (int c = 0; c < channels; c++) xt[c] = xt[c] * scale[c] + shift[c];
-    }
+    bn_args_t args = { x, scale, shift, seq, channels };
+    parallel_for(bn_worker, &args);
     free(scale);
 }
 
@@ -459,38 +508,150 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
  * Activations
  * ======================================================================== */
 
+/*
+ * These three were all serial and all bottlenecked on scalar expf, which the
+ * profile charged ~287 samples -- more than layer norm. Per layer the encoder
+ * evaluates roughly T * 12288 exponentials across two SiLUs, the conv SiLU and
+ * the GLU, so at T = 1490 that is ~290M over 16 layers.
+ *
+ * Two fixes, both parity-safe: thread over the outer axis, and evaluate exp in
+ * tiles through Accelerate's vForce, which is sub-ULP. The scalar fallback keeps
+ * Linux and non-BLAS builds working.
+ */
+#define EW_TILE 512
+
+static void exp_tile(float *dst, const float *src, int n) {
+#if defined(USE_BLAS) && defined(__APPLE__)
+    int nn = n;
+    vvexpf(dst, src, &nn);
+#else
+    for (int i = 0; i < n; i++) dst[i] = expf(src[i]);
+#endif
+}
+
+typedef struct {
+    float *x;
+    int n;
+} silu_args_t;
+
+static void silu_worker(int tid, int n_threads, void *arg) {
+    silu_args_t *a = arg;
+    int per = (a->n + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->n) end = a->n;
+
+    float neg[EW_TILE], ex[EW_TILE];
+    for (int i = start; i < end; i += EW_TILE) {
+        int m = (end - i < EW_TILE) ? end - i : EW_TILE;
+        for (int j = 0; j < m; j++) neg[j] = -a->x[i + j];
+        exp_tile(ex, neg, m);
+        for (int j = 0; j < m; j++) a->x[i + j] /= 1.0f + ex[j];
+    }
+}
+
 void granite_silu(float *x, int n) {
-    for (int i = 0; i < n; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
+    silu_args_t a = { x, n };
+    parallel_for(silu_worker, &a);
+}
+
+typedef struct {
+    float *x;
+    int rows, cols;
+} softmax_args_t;
+
+static void softmax_worker(int tid, int n_threads, void *arg) {
+    softmax_args_t *a = arg;
+    int per = (a->rows + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->rows) end = a->rows;
+
+    float shifted[EW_TILE];
+    for (int r = start; r < end; r++) {
+        float *row = a->x + (size_t)r * a->cols;
+        float mx = row[0];
+        for (int c = 1; c < a->cols; c++) if (row[c] > mx) mx = row[c];
+        for (int c = 0; c < a->cols; c += EW_TILE) {
+            int m = (a->cols - c < EW_TILE) ? a->cols - c : EW_TILE;
+            for (int j = 0; j < m; j++) shifted[j] = row[c + j] - mx;
+            exp_tile(row + c, shifted, m);
+        }
+        /* Summed in index order, matching the original scalar loop. */
+        float sum = 0.0f;
+        for (int c = 0; c < a->cols; c++) sum += row[c];
+        float inv = 1.0f / sum;
+        for (int c = 0; c < a->cols; c++) row[c] *= inv;
+    }
 }
 
 void granite_softmax_rows(float *x, int rows, int cols) {
-    for (int r = 0; r < rows; r++) {
-        float *row = x + (size_t)r * cols;
-        float mx = row[0];
-        for (int c = 1; c < cols; c++) if (row[c] > mx) mx = row[c];
-        float sum = 0.0f;
-        for (int c = 0; c < cols; c++) {
-            row[c] = expf(row[c] - mx);
-            sum += row[c];
+    softmax_args_t a = { x, rows, cols };
+    parallel_for(softmax_worker, &a);
+}
+
+typedef struct {
+    float *out;
+    const float *x;
+    int seq, half;
+} glu_args_t;
+
+static void glu_worker(int tid, int n_threads, void *arg) {
+    glu_args_t *a = arg;
+    int per = (a->seq + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->seq) end = a->seq;
+
+    float neg[EW_TILE], ex[EW_TILE];
+    for (int t = start; t < end; t++) {
+        const float *av = a->x + (size_t)t * a->half * 2;
+        const float *g = av + a->half;
+        float *o = a->out + (size_t)t * a->half;
+        for (int i = 0; i < a->half; i += EW_TILE) {
+            int m = (a->half - i < EW_TILE) ? a->half - i : EW_TILE;
+            for (int j = 0; j < m; j++) neg[j] = -g[i + j];
+            exp_tile(ex, neg, m);
+            for (int j = 0; j < m; j++) o[i + j] = av[i + j] / (1.0f + ex[j]);
         }
-        float inv = 1.0f / sum;
-        for (int c = 0; c < cols; c++) row[c] *= inv;
     }
 }
 
 void granite_glu(float *out, const float *x, int seq, int half) {
-    for (int t = 0; t < seq; t++) {
-        const float *a = x + (size_t)t * half * 2;
-        const float *g = a + half;
-        float *o = out + (size_t)t * half;
-        for (int i = 0; i < half; i++)
-            o[i] = a[i] / (1.0f + expf(-g[i]));
-    }
+    glu_args_t a = { out, x, seq, half };
+    parallel_for(glu_worker, &a);
 }
 
 /* ========================================================================
  * Depthwise conv1d
  * ======================================================================== */
+
+typedef struct {
+    float *out;
+    const float *x, *wf;
+    int seq, channels, kernel, stride, pad_l, out_seq;
+} dw_args_t;
+
+static void dw_worker(int tid, int n_threads, void *arg) {
+    dw_args_t *a = arg;
+    int per = (a->out_seq + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->out_seq) end = a->out_seq;
+
+    for (int o = start; o < end; o++) {
+        float *dst = a->out + (size_t)o * a->channels;
+        memset(dst, 0, (size_t)a->channels * sizeof(float));
+        int base = o * a->stride - a->pad_l;
+        for (int j = 0; j < a->kernel; j++) {
+            int t = base + j;
+            if (t < 0 || t >= a->seq) continue;      /* zero padding */
+            const float *src = a->x + (size_t)t * a->channels;
+            for (int c = 0; c < a->channels; c++)
+                dst[c] += src[c] * a->wf[(size_t)c * a->kernel + j];
+        }
+    }
+}
 
 void granite_depthwise_conv1d_bf16(float *out, const float *x, const uint16_t *w,
                                    int seq, int channels, int kernel,
@@ -499,18 +660,10 @@ void granite_depthwise_conv1d_bf16(float *out, const float *x, const uint16_t *w
     const float *wf = bf16_as_f32(w, (size_t)channels * kernel);
     if (!wf) return;
 
-    for (int o = 0; o < out_seq; o++) {
-        float *dst = out + (size_t)o * channels;
-        memset(dst, 0, (size_t)channels * sizeof(float));
-        int base = o * stride - pad_l;
-        for (int j = 0; j < kernel; j++) {
-            int t = base + j;
-            if (t < 0 || t >= seq) continue;      /* zero padding */
-            const float *src = x + (size_t)t * channels;
-            for (int c = 0; c < channels; c++)
-                dst[c] += src[c] * wf[(size_t)c * kernel + j];
-        }
-    }
+    /* Output frames are independent -- each reads a k-wide window of x and
+     * writes its own row -- so this threads with no coordination. */
+    dw_args_t args = { out, x, wf, seq, channels, kernel, stride, pad_l, out_seq };
+    parallel_for(dw_worker, &args);
 }
 
 /* ========================================================================
