@@ -1,6 +1,6 @@
 # granite.cpp
 
-`granite.cpp` is a lightweight, pure C inference engine for [IBM Granite Speech 5.0](https://huggingface.co/ibm-granite), a 473M-parameter CTC conformer speech-to-text model.
+`granite.cpp` is a lightweight, pure C inference engine for [IBM Granite Speech 5.0](https://huggingface.co/ibm-granite/granite-speech-5.0-470m-turboctc), a 473M-parameter CTC conformer speech-to-text model.
 
 It runs locally with minimal dependencies (standard C library, POSIX threads, and a BLAS library), with no Python runtime, PyTorch, or ONNX needed for inference.
 
@@ -20,7 +20,7 @@ You need `model.safetensors` and `tokenizer.json` from the IBM Granite Speech 5.
 
 ```sh
 # Example using huggingface-cli:
-huggingface-cli download ibm-granite/granite-speech-5.0 \
+huggingface-cli download ibm-granite/granite-speech-5.0-470m-turboctc \
   model.safetensors tokenizer.json \
   --local-dir ./granite-speech-5.0
 ```
