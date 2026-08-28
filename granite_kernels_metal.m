@@ -8,17 +8,13 @@
  * through granite_metal_alloc(), which hands back the `contents` pointer of a
  * MTLResourceStorageModeShared buffer and records the range in `reg`. Every
  * GEMM then resolves its operands to (buffer, offset) by range lookup, so the
- * common case moves no bytes at all. Only unregistered operands -- the
- * front-end features, and the attention distance table -- get staged.
- *
- * Fast math is disabled when compiling the shader. The regression suite
- * requires *exact* argmax agreement with reference.py, and fast-math exp()
- * is not accurate enough to guarantee that on near-ties.
+ * common case moves no bytes at all. The front-end features are the only
+ * operand that is ever unregistered, and they get staged.
  *
  * All entry points are called from the single thread that drives the encoder,
  * so the registry and the staging slots need no locking. granite_metal_alloc()
- * is the exception -- it is reachable from the weight cache under its own
- * mutex -- so it takes `g_lock`.
+ * is the exception, since it is reachable from the weight cache under its own
+ * mutex, so it takes `g_lock`.
  */
 
 #import <Foundation/Foundation.h>
@@ -32,122 +28,12 @@
 
 #include "granite_kernels_metal.h"
 
-/* Threadgroup width for the attention kernel. Must equal GRANITE_DIM_HEAD and
- * be >= GRANITE_CONTEXT_SIZE; both are 128, which is also a clean 4 simdgroups. */
-#define MTL_ATTN_WIDTH 128
-#define MTL_ATTN_SIMDS (MTL_ATTN_WIDTH / 32)
-
-/* ========================================================================
- * Shader source
- *
- * Embedded rather than shipped as a .metal/.metallib so the build stays a
- * plain clang invocation with no metal toolchain step. Compiles in ~30 ms at
- * init, once.
- * ======================================================================== */
-
-static NSString *const kShaderSource = @R"METAL(
-#include <metal_stdlib>
-using namespace metal;
-
-#define ATTN_WIDTH 128
-#define ATTN_SIMDS 4
-
-struct attn_params {
-    uint  block_len;
-    uint  heads;
-    uint  dim_head;
-    uint  ctx;
-    uint  inner;      /* heads * dim_head, the q/k/v row stride */
-    float scale;
-};
-
-/*
- * One threadgroup per (block, head, query) triple, ATTN_WIDTH threads wide.
- *
- * Phase 1: thread j scores key j -- content dot plus Shaw positional dot,
- *          mirroring the CPU kernel's two separate accumulators so the
- *          rounding matches.
- * Phase 2: thread d accumulates output dimension d over all keys.
- */
-kernel void granite_block_attention(
-    device       float       *out   [[buffer(0)]],
-    device const float       *q     [[buffer(1)]],
-    device const float       *k     [[buffer(2)]],
-    device const float       *v     [[buffer(3)]],
-    device const float       *rel   [[buffer(4)]],
-    device const int         *dists [[buffer(5)]],
-    constant     attn_params &P     [[buffer(6)]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint sg   [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]])
-{
-    threadgroup float sq[ATTN_WIDTH];     /* the query row, read block_len times */
-    threadgroup float ss[ATTN_WIDTH];     /* scores, then softmax weights */
-    threadgroup float part[ATTN_SIMDS];   /* cross-simdgroup reduction */
-
-    const uint i    = tgid % P.block_len;
-    const uint h    = (tgid / P.block_len) % P.heads;
-    const uint blk  =  tgid / (P.block_len * P.heads);
-    const uint base = blk * P.block_len;
-    const uint hoff = h * P.dim_head;
-
-    if (tid < P.dim_head)
-        sq[tid] = q[(ulong)(base + i) * P.inner + hoff + tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float s = -INFINITY;
-    if (tid < P.block_len) {
-        device const float *kj = k + (ulong)(base + tid) * P.inner + hoff;
-        device const float *rl = rel + (ulong)dists[i * P.ctx + tid] * P.dim_head;
-        float dot = 0.0f, pos = 0.0f;
-        for (uint d = 0; d < P.dim_head; ++d) {
-            dot += sq[d] * kj[d];
-            pos += sq[d] * rl[d];
-        }
-        s = (dot + pos) * P.scale;
-    }
-
-    /* max over the block */
-    float mx = simd_max(s);
-    if (lane == 0) part[sg] = mx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mx = part[0];
-    for (uint g = 1; g < ATTN_SIMDS; ++g) mx = max(mx, part[g]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    /* exp and sum. Inactive lanes hold 0 and drop out of both reductions. */
-    float e = (tid < P.block_len) ? exp(s - mx) : 0.0f;
-    float sum = simd_sum(e);
-    if (lane == 0) part[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    sum = 0.0f;
-    for (uint g = 0; g < ATTN_SIMDS; ++g) sum += part[g];
-
-    if (tid < P.block_len) ss[tid] = e / sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid < P.dim_head) {
-        float acc = 0.0f;
-        for (uint j = 0; j < P.block_len; ++j)
-            acc += ss[j] * v[(ulong)(base + j) * P.inner + hoff + tid];
-        out[(ulong)(base + i) * P.inner + hoff + tid] = acc;
-    }
-}
-)METAL";
-
-typedef struct {
-    uint32_t block_len, heads, dim_head, ctx, inner;
-    float    scale;
-} attn_params_t;
-
 /* ========================================================================
  * Device state
  * ======================================================================== */
 
 static id<MTLDevice>              g_device = nil;
 static id<MTLCommandQueue>        g_queue  = nil;
-static id<MTLComputePipelineState> g_attn  = nil;
 static int                        g_available = 0;
 static int                        g_verbose = 1;
 static dispatch_once_t            g_once;
@@ -156,9 +42,9 @@ static pthread_mutex_t            g_lock = PTHREAD_MUTEX_INITIALIZER;
 /*
  * MPSMatrixMultiplication compiles a kernel for its shape on construction, so
  * building a fresh one per call charged that to every layer. The encoder only
- * ever uses a handful of distinct (seq, in_dim, out_dim) triples -- the frame
- * count only changes at the two subsampling blocks -- so a tiny cache removes
- * essentially all of the churn.
+ * ever uses a handful of distinct (seq, in_dim, out_dim) triples, since the
+ * frame count only changes at the two subsampling blocks, so a tiny cache
+ * removes essentially all of the churn.
  */
 #define MM_SLOTS 16
 static struct {
@@ -273,31 +159,6 @@ static id<MTLBuffer> operand(const void *p, size_t bytes, int slot, int copy_in,
     return b;
 }
 
-/* ------------------------------------------------- resident const uploads -- */
-
-/* Small read-only tables (the attention distance matrix) that live in plain
- * malloc'd memory for the model's lifetime. Uploaded once, keyed by pointer. */
-#define CONST_SLOTS 4
-static struct { const void *src; size_t len; id<MTLBuffer> buf; } g_const[CONST_SLOTS];
-static int g_const_count = 0;
-
-static id<MTLBuffer> const_upload(const void *p, size_t bytes) {
-    for (int i = 0; i < g_const_count; i++)
-        if (g_const[i].src == p && g_const[i].len == bytes) return g_const[i].buf;
-
-    id<MTLBuffer> b = [g_device newBufferWithBytes:p
-                                           length:bytes
-                                          options:MTLResourceStorageModeShared];
-    if (!b) return nil;
-    if (g_const_count < CONST_SLOTS) {
-        g_const[g_const_count].src = p;
-        g_const[g_const_count].len = bytes;
-        g_const[g_const_count].buf = b;
-        g_const_count++;
-    }
-    return b;
-}
-
 /* ========================================================================
  * Lifecycle
  * ======================================================================== */
@@ -319,41 +180,6 @@ void granite_metal_init(void) {
         if (!g_queue) {
             if (g_verbose >= 1)
                 fprintf(stderr, "[metal] failed to create command queue\n");
-            g_device = nil;
-            return;
-        }
-
-        MTLCompileOptions *opts = [MTLCompileOptions new];
-        /* Parity with reference.py requires exact argmax agreement; fast-math
-         * exp() is not accurate enough to guarantee it on near-ties. */
-        if (@available(macOS 15.0, *)) {
-            opts.mathMode = MTLMathModeSafe;
-        } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            opts.fastMathEnabled = NO;
-#pragma clang diagnostic pop
-        }
-
-        NSError *err = nil;
-        id<MTLLibrary> lib = [g_device newLibraryWithSource:kShaderSource
-                                                   options:opts
-                                                     error:&err];
-        if (!lib) {
-            if (g_verbose >= 1)
-                fprintf(stderr, "[metal] shader compilation failed: %s\n",
-                        [[err localizedDescription] UTF8String]);
-            g_queue = nil;
-            g_device = nil;
-            return;
-        }
-        id<MTLFunction> fn = [lib newFunctionWithName:@"granite_block_attention"];
-        g_attn = [g_device newComputePipelineStateWithFunction:fn error:&err];
-        if (!g_attn) {
-            if (g_verbose >= 1)
-                fprintf(stderr, "[metal] pipeline creation failed: %s\n",
-                        [[err localizedDescription] UTF8String]);
-            g_queue = nil;
             g_device = nil;
             return;
         }
@@ -384,14 +210,11 @@ void granite_metal_shutdown(void) {
     g_reg = NULL;
     g_reg_count = g_reg_cap = 0;
     for (int i = 0; i < STAGE_SLOTS; i++) { g_stage[i] = nil; g_stage_cap[i] = 0; }
-    for (int i = 0; i < CONST_SLOTS; i++) { g_const[i].buf = nil; g_const[i].src = NULL; }
-    g_const_count = 0;
     for (int i = 0; i < MM_SLOTS; i++) {
         g_mm[i].mm = nil; g_mm[i].dx = nil; g_mm[i].dW = nil; g_mm[i].dy = nil;
         g_mm[i].seq = g_mm[i].in_dim = g_mm[i].out_dim = g_mm[i].has_bias = 0;
     }
     g_mm_count = 0;
-    g_attn = nil;
     g_queue = nil;
     g_device = nil;
     g_available = 0;
@@ -399,15 +222,6 @@ void granite_metal_shutdown(void) {
 }
 
 int granite_metal_available(void) { return g_available; }
-
-int granite_metal_attn_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("GRANITE_METAL_ATTN");
-        cached = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return cached;
-}
 
 /* ========================================================================
  * Memory
@@ -507,12 +321,16 @@ static int metal_linear(float *y, const float *x, const float *W,
     size_t ox = 0, oW = 0, oy = 0;
     id<MTLBuffer> bx = operand(x, sx, 0, /*copy_in=*/1, &ox);
     id<MTLBuffer> bW = operand(W, sW, 1, /*copy_in=*/1, &oW);
-    /* y is written, not read -- except that the bias prefill below seeds it,
-     * which we do directly in whichever buffer it lands in. */
+    /* y is written, not read, except that the bias prefill below seeds it, and
+     * that happens directly in whichever buffer it lands in. */
     id<MTLBuffer> by = operand(y, sy, 2, /*copy_in=*/0, &oy);
     if (!bx || !bW || !by) return 0;
 
-    /* Bias goes in as beta=1 on a prefilled C, exactly like the BLAS path. */
+    /* Bias goes in as beta=1 on a prefilled C. The BLAS path deliberately does
+     * the opposite (beta=0 plus a separate add), but do not copy that here: the
+     * prefill is also the CPU touching every page of the result before the GPU
+     * writes it, and without it the CPU reads back stale contents for part of
+     * the output. See the long comment in granite_linear_bf16. */
     float *yd = (float *)((char *)[by contents] + oy);
     if (bias) {
         for (int i = 0; i < seq; i++)
@@ -538,62 +356,4 @@ int granite_metal_linear(float *y, const float *x, const float *W,
     granite_metal_init();
     if (!g_available) return 0;
     return metal_linear(y, x, W, bias, seq, in_dim, out_dim);
-}
-
-/* ========================================================================
- * Block-local attention
- * ======================================================================== */
-
-int granite_metal_block_attention(float *out, const float *q, const float *k,
-                                  const float *v, int seq, int block_len,
-                                  int heads, int dim_head, float scale,
-                                  const float *rel, int n_pos,
-                                  const int32_t *dists, int ctx) {
-    granite_metal_init();
-    if (!g_available) return 0;
-    /* The kernel is written for one threadgroup per query with ATTN_WIDTH
-     * threads covering both the key axis and the head dimension. */
-    if (dim_head != MTL_ATTN_WIDTH || block_len > MTL_ATTN_WIDTH) return 0;
-    if (block_len <= 0 || seq <= 0 || seq % block_len != 0) return 0;
-
-    const int inner = heads * dim_head;
-    const int n_blocks = seq / block_len;
-    const size_t sqkv = (size_t)seq * inner * sizeof(float);
-    const size_t srel = (size_t)n_pos * dim_head * sizeof(float);
-    const size_t sdst = (size_t)ctx * ctx * sizeof(int32_t);
-
-    size_t oq = 0, ok = 0, ov = 0, oo = 0, orel = 0;
-    /* q/k/v/out are encoder scratch, so all four are resident and resolve to
-     * offsets; the staging slots here are a correctness fallback only. */
-    id<MTLBuffer> bq = reg_find(q, sqkv, &oq);
-    id<MTLBuffer> bk = reg_find(k, sqkv, &ok);
-    id<MTLBuffer> bv = reg_find(v, sqkv, &ov);
-    id<MTLBuffer> bo = reg_find(out, sqkv, &oo);
-    id<MTLBuffer> br = reg_find(rel, srel, &orel);
-    if (!bq || !bk || !bv || !bo || !br) return 0;
-
-    id<MTLBuffer> bd = const_upload(dists, sdst);
-    if (!bd) return 0;
-
-    attn_params_t P = {
-        (uint32_t)block_len, (uint32_t)heads, (uint32_t)dim_head,
-        (uint32_t)ctx, (uint32_t)inner, scale,
-    };
-
-    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:g_attn];
-    [enc setBuffer:bo offset:oo   atIndex:0];
-    [enc setBuffer:bq offset:oq   atIndex:1];
-    [enc setBuffer:bk offset:ok   atIndex:2];
-    [enc setBuffer:bv offset:ov   atIndex:3];
-    [enc setBuffer:br offset:orel atIndex:4];
-    [enc setBuffer:bd offset:0    atIndex:5];
-    [enc setBytes:&P length:sizeof(P) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_blocks * heads * block_len, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(MTL_ATTN_WIDTH, 1, 1)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    return 1;
 }

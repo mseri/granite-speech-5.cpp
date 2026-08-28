@@ -2,15 +2,13 @@
  * granite_kernels_metal.h - Metal/MPS backend (Apple Silicon)
  *
  * C-callable interface; safe to include from plain C translation units.
- * Implementation is in granite_kernels_metal.m (Objective-C + MPS + one
- * hand-written compute shader).
+ * Implementation is in granite_kernels_metal.m (Objective-C + MPS).
  *
- * Two things are offloaded, because the profile says they are the only two that
- * matter (see "Performance Notes" in CLAUDE.md):
- *   - every linear, via MPSMatrixMultiplication
- *   - block-local attention, via a custom kernel
- * Norms, GLU, SiLU and the depthwise conv stay on the CPU: they are a small
- * slice of the run and each would cost a dispatch round-trip.
+ * Only the linears are offloaded, via MPSMatrixMultiplication. Attention, norms,
+ * GLU, SiLU and the depthwise conv stay on the CPU. For the elementwise kernels
+ * a dispatch round-trip would cost more than it saves; for attention it was
+ * measured, and a hand-written shader lost to the CPU kernel by roughly 4x on an
+ * M1 (1.00 s against 0.27 s over a 119 s clip).
  *
  * The design point that makes this worthwhile is that activations and the
  * bf16 -> f32 weight cache are allocated *as* Metal shared buffers, so the GPU
@@ -31,7 +29,7 @@
  * without --debug stderr is one summary line, and --silent quiets it entirely.
  *
  *   0  say nothing
- *   1  warnings only -- no device, shader compile failure (the default; these
+ *   1  warnings only: no device, queue creation failure (the default; these
  *      are worth a line because an MPS build silently running on the CPU is a
  *      real problem, and in the normal case nothing is printed)
  *   2  also report the device being used
@@ -41,7 +39,7 @@
  */
 void granite_metal_set_verbose(int level);
 
-/* Bring up the device, queue and shader library. Idempotent and thread-safe;
+/* Bring up the device and command queue. Idempotent and thread-safe;
  * safe to call before every other function here. */
 void granite_metal_init(void);
 
@@ -62,8 +60,8 @@ int granite_metal_available(void);
 /*
  * Allocate `bytes` of shared (CPU+GPU) storage and return a host pointer to it.
  * The backing MTLBuffer is registered, so any pointer into this range is
- * recognized later by the GEMM and attention entry points and used in place
- * without a staging copy.
+ * recognized later by the GEMM entry point and used in place without a staging
+ * copy.
  *
  * Returns NULL if Metal is unavailable or the allocation fails; callers are
  * expected to fall back to malloc.
@@ -71,8 +69,8 @@ int granite_metal_available(void);
 void *granite_metal_alloc(size_t bytes);
 
 /* Free a pointer obtained from granite_metal_alloc(). Returns 1 if `p` was a
- * registered base pointer (and is now released), 0 if it was not ours -- in
- * which case the caller still owns it and should free() it. NULL returns 0. */
+ * registered base pointer (and is now released), 0 if it was not ours, in which
+ * case the caller still owns it and should free() it. NULL returns 0. */
 int granite_metal_dealloc(void *p);
 
 /* ----------------------------------------------------------------- dispatch -- */
@@ -80,12 +78,6 @@ int granite_metal_dealloc(void *p);
 /* 1 when a seq x in_dim x out_dim linear is worth a GPU dispatch. Small
  * matrices lose to dispatch latency even on unified memory. */
 int granite_metal_should_offload(int seq, int in_dim, int out_dim);
-
-/* 1 when granite_metal_block_attention should be preferred over the CPU kernel.
- * Off unless GRANITE_METAL_ATTN is set to something other than 0: on an M1 the
- * shader measured 1.00 s against the CPU kernel's 0.27 s over a 119 s clip.
- * See the comment at the call site in granite_kernels.c. */
-int granite_metal_attn_enabled(void);
 
 /* -------------------------------------------------------------------- gemm -- */
 
@@ -99,21 +91,5 @@ int granite_metal_attn_enabled(void);
  */
 int granite_metal_linear(float *y, const float *x, const float *W,
                          const float *bias, int seq, int in_dim, int out_dim);
-
-/* --------------------------------------------------------------- attention -- */
-
-/*
- * Block-local multi-head attention with Shaw relative-position bias -- the GPU
- * twin of granite_block_attention(). Same shapes and semantics, except `rel`
- * arrives already converted to f32 and its row count `n_pos` is explicit.
- *
- * Returns 1 if the result was computed, 0 if the caller must fall back to CPU
- * (unsupported shape, or no device).
- */
-int granite_metal_block_attention(float *out, const float *q, const float *k,
-                                  const float *v, int seq, int block_len,
-                                  int heads, int dim_head, float scale,
-                                  const float *rel, int n_pos,
-                                  const int32_t *dists, int ctx);
 
 #endif /* GRANITE_KERNELS_METAL_H */

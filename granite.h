@@ -156,11 +156,11 @@ char *granite_transcribe(granite_model_t *m, const float *samples, int n_samples
 /* Segmented transcription: split the audio at low-energy points near each
  * nominal boundary and decode the pieces independently.
  *
- * This bounds the size of individual allocations -- a whole-clip decode needs
- * one contiguous n_frames * 16384 float buffer for the logits, which is ~1.4 GB
- * per 30 minutes and can simply fail to allocate. It does NOT meaningfully
- * lower peak RSS: the bf16 -> f32 weight cache dominates that (measured 3.0 GB
- * whole-clip vs 3.1 GB segmented on 30 minutes of audio).
+ * This bounds the size of individual allocations. A whole-clip decode needs one
+ * contiguous n_frames * 16384 float buffer for the logits, which is ~1.4 GB per
+ * 30 minutes and can simply fail to allocate. It does not meaningfully lower
+ * peak RSS: the bf16 -> f32 weight cache dominates that (measured 3.0 GB
+ * whole-clip against 3.1 GB segmented on 30 minutes of audio).
  *
  * With p->segment_sec == 0 this is exactly granite_transcribe. */
 char *granite_transcribe_segmented(granite_model_t *m, const float *samples,

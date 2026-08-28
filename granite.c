@@ -203,7 +203,6 @@ char *granite_transcribe_segmented(granite_model_t *m, const float *samples,
  * Streaming mode
  * ======================================================================== */
 
-/* Per-frame argmax over the CTC vocabulary. */
 static void argmax_frames(const float *logits, int n_frames, int *out) {
     for (int t = 0; t < n_frames; t++) {
         const float *row = logits + (size_t)t * GRANITE_VOCAB;
@@ -253,7 +252,7 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
         int avail = granite_live_audio_wait(la, want, &eof);
 
         /* Advance the window end to whatever has arrived, but never far enough
-         * that its start would pass the committed frontier -- otherwise a fast
+         * that its start would pass the committed frontier. Otherwise a fast
          * producer (a pipe delivering the whole file at once) would leave the
          * skipped span undecoded. With a backlog this strides window-at-a-time. */
         int max_end = committed * spf + window;
@@ -271,7 +270,7 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
          * frame boundary. Attention is block-local over GRANITE_CONTEXT_SIZE
          * frames, so a start that is not block-aligned shifts the whole block
          * grid relative to the previous window and re-decodes frames under
-         * different context -- which is what produces boundary artifacts. */
+         * different context, which is what produces boundary artifacts. */
         const int block_samples = GRANITE_CONTEXT_SIZE * spf;
         win_start = end - window;
         if (win_start < 0) win_start = 0;
@@ -315,7 +314,7 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
         if (!(eof && win_end >= avail)) {
             limit -= lookahead_frames;
             /* Before a full attention block of audio exists, no frame has seen
-             * the context the model was trained with -- the window's right edge
+             * the context the model was trained with: the window's right edge
              * is padding, not signal. Committing there bakes in artifacts that
              * later windows cannot undo, so hold everything back. Clips shorter
              * than a block therefore commit once, at EOF, matching offline. */

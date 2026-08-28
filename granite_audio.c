@@ -467,7 +467,7 @@ float *granite_frontend(const granite_model_t *m, const float *samples,
     int need = (n_frames - 1) * hop + 1;
 
     /* _frontend right-pads the waveform up to `need` but never truncates it, so
-     * longer input keeps its tail — which the reflect padding below then sees.
+     * longer input keeps its tail, which the reflect padding below then sees.
      * Trimming to `need` here would corrupt the final frames. */
     int siglen = n_samples > need ? n_samples : need;
 

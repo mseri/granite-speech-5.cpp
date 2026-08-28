@@ -192,9 +192,9 @@ float granite_bf16_to_f32(uint16_t h) {
 /*
  * Residual adds. These look too cheap to bother with, but the encoder runs
  * three of them per layer over the full T * HIDDEN activation, and left serial
- * they measured ~0.19 s of a 2.8 s decode -- the same Amdahl trap that the
- * bf16 conversion and the activations were in. Elementwise, so threading
- * changes no arithmetic.
+ * they measured ~0.19 s of a 2.8 s decode: the same Amdahl trap that the bf16
+ * conversion and the activations were in. Elementwise, so threading changes no
+ * arithmetic.
  */
 typedef struct {
     float *a;
@@ -532,7 +532,7 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
      * than moving to add_bias_rows like the BLAS path below. That is not a
      * missed cleanup: the prefill is load-bearing. It is the CPU touching every
      * page of the result before the GPU writes it, and without it the CPU reads
-     * back stale contents for part of the output -- silently, with the command
+     * back stale contents for part of the output, silently, with the command
      * buffer reporting success. It only shows up once a buffer lands on
      * recycled rather than fresh (zero-filled) pages, so a whole-clip decode
      * looks fine and the second segment of a segmented decode fills with NaN.
@@ -546,7 +546,7 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
     /* beta = 0 and a separate bias pass, rather than broadcasting the bias into
      * C and letting sgemm accumulate onto it. The latter makes BLAS read C back
      * as an input, and the broadcast itself is a serial write over the whole
-     * seq * out_dim output -- on the FF1 shape that measured 17.1 ms against
+     * seq * out_dim output. On the FF1 shape that measured 17.1 ms against
      * 13.4 ms for the bare GEMM. The bias add is the same sum in the same order,
      * so the result is unchanged. */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -665,7 +665,7 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
 
 /*
  * These three were all serial and all bottlenecked on scalar expf, which the
- * profile charged ~287 samples -- more than layer norm. Per layer the encoder
+ * profile charged ~287 samples, more than layer norm. Per layer the encoder
  * evaluates roughly T * 12288 exponentials across two SiLUs, the conv SiLU and
  * the GLU, so at T = 1490 that is ~290M over 16 layers.
  *
@@ -815,8 +815,8 @@ void granite_depthwise_conv1d_bf16(float *out, const float *x, const uint16_t *w
     const float *wf = bf16_as_f32(w, (size_t)channels * kernel);
     if (!wf) return;
 
-    /* Output frames are independent -- each reads a k-wide window of x and
-     * writes its own row -- so this threads with no coordination. */
+    /* Output frames are independent (each reads a k-wide window of x and writes
+     * its own row), so this threads with no coordination. */
     dw_args_t args = { out, x, wf, seq, channels, kernel, stride, pad_l, out_seq };
     parallel_for(dw_worker, &args);
 }
@@ -838,8 +838,8 @@ typedef struct {
 /*
  * Query blocking (QBLK): this kernel is bound by dependency-chain latency, not
  * by flops. One query row against one key is a 128-element dot reduced into a
- * single NEON accumulator -- a 32-long chain of 4-cycle FMAs that uses one of
- * the four FMA pipes. Measured, the whole kernel ran at ~53 GFLOP/s while
+ * single NEON accumulator, a 32-long chain of 4-cycle FMAs that uses one of the
+ * four FMA pipes. Measured, the whole kernel ran at ~53 GFLOP/s while
  * Accelerate's sgemm reaches ~1000 on the same machine.
  *
  * The fix is to run QBLK query rows against each key at once. That yields
@@ -847,8 +847,8 @@ typedef struct {
  * each k_j / v_j load is shared across QBLK queries instead of being re-read.
  *
  * Every accumulator still sums over d in the same order as the scalar path did,
- * and the j loop still runs ascending, so this is bit-identical to the original
- * -- which matters because the suite demands exact argmax agreement.
+ * and the j loop still runs ascending, so this is bit-identical to the original,
+ * which matters because the suite demands exact argmax agreement.
  */
 #define QBLK 4
 
@@ -881,8 +881,8 @@ static void attn_row_finish(float *row, int L, float *oi, const float *v,
     }
 }
 
-/* Scores for a single query row -- the original inner loop, kept for the tail
- * of a block whose length is not a multiple of QBLK. */
+/* Scores for a single query row: the original inner loop, kept for the tail of
+ * a block whose length is not a multiple of QBLK. */
 static void attn_row_scores(const attn_args_t *a, float *row, int i,
                             int off, int inner, int hoff) {
     const int L = a->block_len, D = a->dim_head;
@@ -1010,27 +1010,6 @@ void granite_block_attention(float *out, const float *q, const float *k,
     int n_pos = 2 * GRANITE_MAX_POS_EMB + 1;
     const float *rel = bf16_as_f32(rel_pos_emb, (size_t)n_pos * dim_head);
     if (!rel) return;
-
-#ifdef USE_MPS
-    /*
-     * The attention shader is off by default -- measured, on an M1, at 1.00 s
-     * against 0.27 s for the CPU kernel below over a 119 s clip. It is not a
-     * tuning gap: the shader runs one threadgroup per query, so thread j reads
-     * key row j, and consecutive threads land `inner` floats apart. Every device
-     * read is its own cache line, and each of the 128 queries in a block re-reads
-     * the whole K tile and the whole Shaw window from device memory. Fixing it
-     * means tiling K/V through threadgroup memory (ideally simdgroup_matrix),
-     * not a constant factor.
-     *
-     * Set GRANITE_METAL_ATTN=1 to use it anyway; worth re-measuring on a GPU
-     * much wider than an M1's 8 cores before changing the default.
-     */
-    if (0 &&
-        granite_metal_block_attention(out, q, k, v, seq, block_len, heads,
-                                      dim_head, scale, rel, n_pos, dists, ctx)) {
-        return;
-    }
-#endif
 
     attn_args_t args = {
         out, q, k, v, seq / block_len, block_len, heads, dim_head,

@@ -57,8 +57,8 @@ quietest point within `-W` seconds so boundaries land in pauses:
 ```
 
 This avoids a single huge logits allocation (one contiguous
-`frames × 16384` float buffer, ~1.4 GB per 30 minutes). It does **not** lower
-peak RSS — the weight cache dominates that.
+`frames × 16384` float buffer, ~1.4 GB per 30 minutes). It does not lower peak
+RSS; the weight cache dominates that.
 
 ### Options
 
@@ -81,7 +81,7 @@ peak RSS — the weight cache dominates that.
 
 ## Model
 
-The output is **lowercase and unpunctuated** — that is inherent to this model's
+The output is lowercase and unpunctuated. That is inherent to this model's
 16k-entry CTC vocabulary, not a limitation of this implementation.
 
 | | |
@@ -106,8 +106,8 @@ and folded back in through `out_mid`.
 ## Correctness
 
 `reference.py` is a self-contained PyTorch implementation built from the
-checkpoint's own tensor names — it needs no `transformers`, since Granite Speech
-5.0 ships as `transformers 5.16.0.dev0`, which is unreleased. It is the parity
+checkpoint's own tensor names, so it needs no `transformers`: Granite Speech 5.0
+ships as `transformers 5.16.0.dev0`, which is unreleased. It is the parity
 oracle, not part of the inference path.
 
 ```sh
@@ -115,8 +115,8 @@ make test        # or: ./test_granite.py
 ```
 
 The harness runs both implementations over real samples and a synthetic length
-sweep chosen to exercise the awkward shapes — a trailing attention block shorter
-than the 128-frame context, and odd frame counts hitting the subsampling trim:
+sweep chosen to exercise the awkward shapes: a trailing attention block shorter
+than the 128-frame context, and odd frame counts hitting the subsampling trim.
 
 ```
     feats  max|d| = 4.554e-05 over 176000 values
@@ -124,20 +124,21 @@ than the 128-frame context, and odd frame counts hitting the subsampling trim:
   PASS jfk.wav
 ```
 
-Features match to ~1e-5 and logits to ~1e-4; argmax agrees on **100% of frames**
-in every case, which is what actually determines the transcript.
+Features match to ~1e-5 and logits to ~1e-4; argmax agrees on 100% of frames in
+every case, which is what determines the transcript.
 
 ## Chunked decoding
 
 Attention is block-local over 128 encoder frames, and a frame is 80 ms, so the
-model's effective receptive field is **one attention block ≈ 10.2 s**. Measured
-directly: perturbing 10 ms of audio changes logits across exactly frames 0–127
+model's effective receptive field is one attention block, about 10.2 s. Measured
+directly: perturbing 10 ms of audio changes logits across exactly frames 0 to 127
 of its block, and only weakly beyond. Everything about chunking follows from
 that number.
 
 - Segments below 10.2 s are clamped up to it.
-- Streaming windows start on **block boundaries**. Aligning only to frames
-  shifts the whole block grid between windows and was worth ~1.8% WER.
+- Streaming windows start on block boundaries, not merely frame boundaries.
+  Aligning only to frames shifts the whole block grid between windows and was
+  worth ~1.8% WER.
 - Nothing is committed until a full block of audio exists; before that the
   window's right edge is padding rather than signal.
 
@@ -147,7 +148,7 @@ Cost of chunking, measured against the whole-clip decode:
 | --- | --- | --- |
 | 11s / 3.6s samples | 0.00% | 0.00% |
 | 119s real speech | 2.21% | 0.44% |
-| 10 min | — | 0.61% |
+| 10 min | not measured | 0.61% |
 
 Streaming tracks offline more closely than segmented because it re-decodes
 overlapping context and commits only settled frames, where segmented decodes
@@ -165,28 +166,28 @@ Apple Silicon, `make blas`, 8 threads, model file warm in the page cache:
 | 11s | 0.62s | 0.057 |
 | 66s | 2.24s | 0.034 |
 
-Roughly 9–29× realtime, improving with clip length as fixed costs amortize.
+Roughly 9x to 29x realtime, improving with clip length as fixed costs amortize.
 A 10-minute file decodes in ~20 s (RTF 0.033).
 
 Peak RSS is ~2.4 GB by default, dominated by the bf16→f32 weight cache;
 `--weight-cache 0` drops that to ~1.3 GB by reconverting weights per call.
-Neither `-S` nor `--stream` reduces peak RSS meaningfully (measured 3.0 GB
-whole-clip vs 3.1 GB segmented on 30 minutes) — the weights dominate.
+Neither `-S` nor `--stream` reduces peak RSS meaningfully, since the weights
+dominate: measured 3.0 GB whole-clip against 3.1 GB segmented on 30 minutes.
 
 ## Backends
 
 | | `make blas` | `make mps` |
 | --- | --- | --- |
 | Linears | `cblas_sgemm` | `MPSMatrixMultiplication` |
-| Block attention | NEON + thread pool | Metal compute shader |
+| Block attention | NEON + thread pool | NEON + thread pool |
 | Norms, GLU, SiLU, depthwise conv | CPU | CPU |
 | Platforms | macOS, Linux | macOS on Apple Silicon |
 
 The MPS backend allocates the weight cache and every encoder scratch buffer as
-Metal *shared* buffers, so the GPU reads the same bytes the CPU wrote. Operands
+Metal shared buffers, so the GPU reads the same bytes the CPU wrote. Operands
 are never uploaded per call and the 1.8 GB weight cache is not duplicated on the
-device — that is the point of the design, and without it the device would need
-its own second copy.
+device. That is the point of the design; without it the device would need its
+own second copy.
 
 It still costs some memory, measured on an M1:
 
@@ -195,13 +196,15 @@ It still costs some memory, measured on an M1:
 | `make blas` | 2242 MB | 2506 MB |
 | `make mps` | 2767 MB | 2690 MB |
 
-The ~180–525 MB overhead is per-buffer page rounding across the ~390 weight
-allocations, MPS internal workspaces, and the staging slots. Do not describe the
-MPS build as memory-neutral; it is not.
+The 180 to 525 MB of overhead is per-buffer page rounding across the ~390 weight
+allocations, MPS internal workspaces, and the staging slots. The MPS build is
+not memory-neutral.
 
-Norms and elementwise ops stay on the CPU deliberately — each would cost a
-dispatch round-trip to save very little. Under `--debug` the backend reports the
-device it selected:
+Only the linears go to the GPU. Norms and elementwise ops stay on the CPU
+because each would cost a dispatch round-trip to save very little, and attention
+stays there because it was tried: a hand-written shader measured 1.00 s against
+the CPU kernel's 0.27 s over a 119 s clip, so it was removed. Under `--debug`
+the backend reports the device it selected:
 
 ```
 $ ./granite -d granite-speech-5.0 -i audio.wav --debug
@@ -218,7 +221,7 @@ If that line is absent on an `mps` build, the run went to BLAS.
 | `granite.c` | model load/free, end-to-end transcription |
 | `granite_encoder.c` | conformer forward pass, weight binding |
 | `granite_kernels.c` | thread pool, bf16 GEMM, norms, attention, conv |
-| `granite_kernels_metal.m` | Metal backend: shared buffers, MPS GEMM, attention shader |
+| `granite_kernels_metal.m` | Metal backend: shared buffers, MPS GEMM |
 | `granite_audio.c` | WAV I/O, FFT, mel filterbank, front-end |
 | `granite_tokenizer.c` | decode-only BPE (CTC never encodes text) |
 | `granite_safetensors.c` | mmap'd checkpoint reader (from `qwen-asr`) |

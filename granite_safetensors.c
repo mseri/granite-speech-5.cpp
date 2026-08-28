@@ -312,7 +312,7 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
 
     char path[4096];
 
-    /* Try single file first */
+    /* Single file first */
     snprintf(path, sizeof(path), "%s/model.safetensors", model_dir);
     safetensors_file_t *sf = safetensors_open(path);
     if (sf) {
@@ -321,15 +321,8 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         return ms;
     }
 
-    /* Try multi-shard: model-00001-of-NNNNN.safetensors */
-    for (int i = 1; i <= SAFETENSORS_MAX_SHARDS; i++) {
-        snprintf(path, sizeof(path), "%s/model-%05d-of-%05d.safetensors",
-                 model_dir, i, i); /* placeholder - need to detect count */
-        /* We don't know the total count yet, try common patterns */
-        break;
-    }
-
-    /* Scan directory for shard files */
+    /* Otherwise scan for model-*.safetensors shards; the total count is not
+     * known up front, so the directory listing is the only way to find them. */
     DIR *dir = opendir(model_dir);
     if (!dir) { free(ms); return NULL; }
 
@@ -353,10 +346,9 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         return NULL;
     }
 
-    /* Sort shard names to ensure consistent ordering */
+    /* Sorted so shard order is consistent across runs. */
     qsort(shard_names, n_shards, 256, (int(*)(const void*,const void*))strcmp);
 
-    /* Open each shard */
     for (int i = 0; i < n_shards; i++) {
         snprintf(path, sizeof(path), "%s/%s", model_dir, shard_names[i]);
         ms->shards[i] = safetensors_open(path);
