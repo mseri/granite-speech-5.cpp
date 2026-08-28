@@ -501,37 +501,28 @@ float *granite_frontend(const granite_model_t *m, const float *samples,
         logmel[i] = v / 4.0f + 1.0f;
     }
 
-    /* Deltas along time: (-x[t-1] + x[t+1]) / 2 with replicate padding. */
-    float *deltas = malloc((size_t)n_mels * n_frames * sizeof(float));
-    if (!deltas) { free(logmel); return NULL; }
-    for (int b = 0; b < n_mels; b++) {
-        const float *row = logmel + (size_t)b * n_frames;
-        float *drow = deltas + (size_t)b * n_frames;
-        for (int t = 0; t < n_frames; t++) {
-            float prev = row[t > 0 ? t - 1 : 0];
-            float next = row[t + 1 < n_frames ? t + 1 : n_frames - 1];
-            drow[t] = (next - prev) / 2.0f;
-        }
-    }
-
-    /* Interleave static+delta per frame (160 dims), then stack `s` frames. */
+    /* Interleave static+delta per frame (160 dims), then stack `s` frames.
+     * Compute each delta here instead of materializing another mel-sized buffer:
+     * logmel stays immutable, so this is the same arithmetic and edge padding. */
     int out_n = n_frames / s;
     float *feats = malloc((size_t)out_n * GRANITE_INPUT_DIM * sizeof(float));
-    if (!feats) { free(logmel); free(deltas); return NULL; }
+    if (!feats) { free(logmel); return NULL; }
     for (int o = 0; o < out_n; o++) {
         float *dst = feats + (size_t)o * GRANITE_INPUT_DIM;
         for (int k = 0; k < s; k++) {
             int t = o * s + k;
             float *slot = dst + k * (2 * n_mels);
+            int prev_t = t > 0 ? t - 1 : 0;
+            int next_t = t + 1 < n_frames ? t + 1 : n_frames - 1;
             for (int b = 0; b < n_mels; b++) {
-                slot[b] = logmel[(size_t)b * n_frames + t];
-                slot[n_mels + b] = deltas[(size_t)b * n_frames + t];
+                const float *row = logmel + (size_t)b * n_frames;
+                slot[b] = row[t];
+                slot[n_mels + b] = (row[next_t] - row[prev_t]) / 2.0f;
             }
         }
     }
 
     free(logmel);
-    free(deltas);
     *out_frames = out_n;
     return feats;
 }

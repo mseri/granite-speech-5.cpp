@@ -587,7 +587,13 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
                              int seq, int channels, float eps) {
     /* Fold the affine and the statistics into a single scale/shift per channel
      * so the inner loop over frames is one FMA. */
-    float *scale = malloc((size_t)channels * 2 * sizeof(float));
+    /* The encoder always uses CONV_INNER channels.  Keep its temporary
+     * affine coefficients on the stack rather than allocating them once per
+     * conformer block; retain a heap fallback for the public kernel API. */
+    enum { BN_STACK_CHANNELS = GRANITE_HIDDEN * GRANITE_CONV_EXPANSION };
+    float scale_stack[BN_STACK_CHANNELS * 2];
+    float *scale = channels <= BN_STACK_CHANNELS
+                     ? scale_stack : malloc((size_t)channels * 2 * sizeof(float));
     if (!scale) return;
     float *shift = scale + channels;
     for (int c = 0; c < channels; c++) {
@@ -598,7 +604,7 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
     }
     bn_args_t args = { x, scale, shift, seq, channels };
     parallel_for(bn_worker, &args);
-    free(scale);
+    if (scale != scale_stack) free(scale);
 }
 
 
@@ -893,8 +899,9 @@ static void block_attn_worker(int tid, int n_threads, void *arg) {
     const int inner = a->heads * a->dim_head;
     const int total = a->n_blocks * a->heads;
     const int L = a->block_len, D = a->dim_head;
-    float *scores = malloc((size_t)QBLK * L * sizeof(float));
-    if (!scores) return;
+    /* block_len is at most the fixed attention context.  A stack buffer
+     * avoids a malloc/free pair for every head on every encoder layer. */
+    float scores[QBLK * GRANITE_CONTEXT_SIZE];
 
     for (int job = tid; job < total; job += n_threads) {
         int blk = job / a->heads;
@@ -917,7 +924,6 @@ static void block_attn_worker(int tid, int n_threads, void *arg) {
                             a->v, off, inner, hoff, D);
         }
     }
-    free(scores);
 }
 
 void granite_block_attention(float *out, const float *q, const float *k,
