@@ -169,4 +169,12 @@ granite.cpp/
 
 ## License
 
-Apache 2.0.
+MIT
+
+## Use of LLMs
+
+The project is largely vibecoded with Opus 5.0 at low thinking effort,
+running under human supervision, starting from my fork of [qwen-asr](github.com/mseri/qwen-asr)
+and proceeding from there. Some manual cleanup started happening only
+after everything was working fine, so don't be surprise about leftover
+or past AI slop in the text.

@@ -5,6 +5,7 @@
 # reference oracle environment
 /.venv/
 /.uvcache/
+**/__pycache__/
 
 # model weights (downloaded separately)
 /granite-speech-5.0/
