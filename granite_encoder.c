@@ -1,15 +1,4 @@
-/*
- * granite_encoder.c - Conformer encoder forward pass + weight binding
- *
- * Per block (granite_encoder._ConformerBlock):
- *   x += 0.5 * FF1(x)
- *   x += Attention(x)            block-local, Shaw relative-position bias
- *   x  = ConvModule(x) + pool(x) subsampling blocks halve time; others add
- *   x += 0.5 * FF2(x)
- *   x  = LayerNorm(x)
- * After block 8 (num_layers / 2) the CTC head output is softmaxed and folded
- * back in through out_mid.
- */
+/* Conformer encoder forward pass and checkpoint binding. */
 
 #include "granite.h"
 #include "granite_kernels.h"
@@ -25,9 +14,6 @@
 #define LN_EPS 1e-5f
 #define BN_EPS 1e-5f
 
-/* ========================================================================
- * Weight binding
- * ======================================================================== */
 
 static const uint16_t *bind_bf16(const multi_safetensors_t *ms, const char *name) {
     safetensors_file_t *sf = NULL;
@@ -120,9 +106,6 @@ int granite_bind_weights(granite_weights_t *w, const multi_safetensors_t *ms) {
     return 0;
 }
 
-/* ========================================================================
- * Scratch buffers
- * ======================================================================== */
 
 typedef struct {
     float *norm;    /* [T, HIDDEN]     normalized input to a sublayer */
@@ -158,9 +141,7 @@ static int scratch_alloc(scratch_t *s, int T) {
     s->ff     = granite_device_alloc((size_t)T * FF_INNER * sizeof(float));
     s->conv   = granite_device_alloc((size_t)T * CONV_INNER * sizeof(float));
     s->conv_o = granite_device_alloc((size_t)T * CONV_INNER * sizeof(float));
-    /* Mid-injection runs at layer 8, well past both subsampling blocks, so it
-     * only ever sees T/4 frames. Sizing this at T would reserve 4x the largest
-     * buffer in the model (T * 16384 floats). */
+    /* Mid-injection follows both subsampling blocks, so it uses T/4 rows. */
     s->mid    = granite_device_alloc(((size_t)(T / 4) + 2) * GRANITE_VOCAB * sizeof(float));
     if (!s->norm || !s->q || !s->k || !s->v || !s->attn || !s->proj ||
         !s->ff || !s->conv || !s->conv_o || !s->mid) {
@@ -170,9 +151,6 @@ static int scratch_alloc(scratch_t *s, int T) {
     return 0;
 }
 
-/* ========================================================================
- * Sublayers
- * ======================================================================== */
 
 /* x += 0.5 * FF(x) */
 static void feed_forward(float *x, int T, scratch_t *s,
@@ -187,8 +165,7 @@ static void feed_forward(float *x, int T, scratch_t *s,
     granite_add_scaled_inplace(x, s->proj, 0.5f, T * GRANITE_HIDDEN);
 }
 
-/* x += Attention(x). Full blocks of CONTEXT_SIZE, then a trailing block at its
- * true length (granite_encoder._SeparateQKVAttention). */
+/* Add block-local attention, including a true-length trailing block. */
 static void attention(float *x, int T, scratch_t *s, const granite_layer_t *L,
                       const int32_t *dists) {
     const int c = GRANITE_CONTEXT_SIZE;
@@ -227,8 +204,7 @@ static int conv_module(const float *x, int T, scratch_t *s,
                        const granite_layer_t *L) {
     const int k = GRANITE_CONV_KERNEL;
     const int stride = L->subsample ? 2 : 1;
-    /* Stock GraniteSpeechConformerDepthWiseConv1d pads (pad, pad - (k+1) % 2);
-     * k = 7 is odd, so both sides get k/2 = 3. */
+    /* For the odd k=7 kernel, padding is three samples on each side. */
     const int pad = k / 2;
     const int pad_r = pad - (k + 1) % 2;
 
@@ -250,9 +226,6 @@ static int conv_module(const float *x, int T, scratch_t *s,
     return out_T;
 }
 
-/* ========================================================================
- * Forward
- * ======================================================================== */
 
 float *granite_encode(const granite_model_t *m, const float *feats,
                       int n_frames, int *out_frames) {
@@ -277,10 +250,7 @@ float *granite_encode(const granite_model_t *m, const float *feats,
 
         int conv_T = conv_module(x, T, &s, L);
         if (L->subsample) {
-            /* Mean-pool the residual to half rate (dropping a trailing odd
-             * frame) and trim the conv output to match. The pool is threaded
-             * and so cannot write back into x; it lands in s.norm (dead at this
-             * point, and the same T * HIDDEN shape) and the two swap roles. */
+            /* Pool the residual out of place and drop a trailing odd frame. */
             int t_half = T / 2;
             granite_subsample_pool_add(s.norm, x, s.proj, t_half, GRANITE_HIDDEN);
             float *tmp = x; x = s.norm; s.norm = tmp;
@@ -292,9 +262,7 @@ float *granite_encode(const granite_model_t *m, const float *feats,
 
         feed_forward(x, T, &s, L->norm_ff2_w, L->norm_ff2_b,
                      L->ff2_l1_w, L->ff2_l1_b, L->ff2_l2_w, L->ff2_l2_b);
-        /* Safe in place: the mean and variance loops finish before any store,
-         * and the affine loop reads and writes the same index. Saves copying
-         * T * HIDDEN floats back out of scratch on every layer. */
+        /* LayerNorm permits aliasing, avoiding a full scratch-buffer copy. */
         granite_layer_norm_bf16(x, x, L->norm_out_w, L->norm_out_b,
                                 T, GRANITE_HIDDEN, LN_EPS);
 
@@ -309,8 +277,7 @@ float *granite_encode(const granite_model_t *m, const float *feats,
         }
     }
 
-    /* Device-allocated, so the CTC head GEMM writes straight into it. Callers
-     * release this with granite_logits_free, not free(). */
+    /* Device-allocated for the CTC head; release with granite_logits_free. */
     float *logits = granite_device_alloc((size_t)T * GRANITE_VOCAB * sizeof(float));
     if (logits)
         granite_linear_bf16(logits, x, m->w.out_w, m->w.out_b,

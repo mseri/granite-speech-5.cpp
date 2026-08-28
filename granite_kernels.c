@@ -1,11 +1,4 @@
-/*
- * granite_kernels.c - Math kernels for Granite Speech 5.0 inference
- *
- * The thread pool is adapted from the qwen-asr project. Unlike qwen-asr's
- * decoder, every matmul here is a real GEMM over the frame axis (there is no
- * seq=1 step), so the linear path is bf16 -> f32 weight conversion feeding
- * cblas_sgemm, with converted weights cached across calls.
- */
+/* Math kernels for Granite Speech 5.0 inference. */
 
 #include "granite_kernels.h"
 #include "granite.h"
@@ -38,13 +31,7 @@
 #include "granite_kernels_metal.h"
 #endif
 
-/* ========================================================================
- * Allocation
- *
- * Under Metal these are shared (CPU+GPU) buffers, which is what keeps the
- * 1.8 GB weight cache from being duplicated on the device: the GPU reads the
- * exact bytes the bf16 -> f32 conversion wrote.
- * ======================================================================== */
+/* Allocate shared CPU/GPU buffers when Metal is enabled. */
 
 void *granite_device_alloc(size_t bytes) {
 #ifdef USE_MPS
@@ -61,9 +48,6 @@ void granite_device_free(void *p) {
     free(p);
 }
 
-/* ========================================================================
- * Thread pool (adapted from qwen-asr)
- * ======================================================================== */
 
 #define GRANITE_MAX_THREADS 32
 
@@ -179,9 +163,6 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
     pthread_mutex_unlock(&tp.mutex);
 }
 
-/* ========================================================================
- * Basics
- * ======================================================================== */
 
 float granite_bf16_to_f32(uint16_t h) {
     union { uint32_t u; float f; } v;
@@ -189,13 +170,7 @@ float granite_bf16_to_f32(uint16_t h) {
     return v.f;
 }
 
-/*
- * Residual adds. These look too cheap to bother with, but the encoder runs
- * three of them per layer over the full T * HIDDEN activation, and left serial
- * they measured ~0.19 s of a 2.8 s decode: the same Amdahl trap that the bf16
- * conversion and the activations were in. Elementwise, so threading changes no
- * arithmetic.
- */
+/* Thread the encoder's elementwise residual adds. */
 typedef struct {
     float *a;
     const float *b;
@@ -313,9 +288,8 @@ static void bf16_to_f32_range(float *dst, const uint16_t *src, size_t n) {
     for (; i < n; i++) dst[i] = granite_bf16_to_f32(src[i]);
 }
 
-/* Converting the whole checkpoint writes ~1.9 GB of f32. Left on one thread it
- * was the single largest entry in the profile (~39% of all CPU work) and, being
- * serial, it capped what either backend could win. */
+/* Convert large weight tensors in parallel so conversion does not bottleneck
+ * either backend. */
 typedef struct {
     float *dst;
     const uint16_t *src;
@@ -344,13 +318,7 @@ static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
     parallel_for(conv_worker, &a);
 }
 
-/* ========================================================================
- * bf16 -> f32 weight cache
- *
- * Every weight tensor is converted at most once and reused for the rest of the
- * run. Entries are keyed by source pointer, which is stable because the
- * checkpoint stays mmap'd for the model's lifetime.
- * ======================================================================== */
+/* Cache converted weights by their stable mapped source pointer. */
 
 #define WCACHE_MAX_ENTRIES 1024
 
@@ -383,8 +351,7 @@ size_t granite_weight_cache_bytes(void) {
     return used;
 }
 
-/* Scratch buffer used when a weight does not fit in the cache. Per-thread is
- * unnecessary: conversion happens on the calling thread before parallel_for. */
+/* Shared fallback buffer for weights that exceed the cache limit. */
 static float *scratch = NULL;
 static size_t scratch_n = 0;
 
@@ -415,9 +382,7 @@ static const float *bf16_as_f32(const uint16_t *src, size_t n) {
             return buf;
         }
     }
-    /* Over the cap (or out of memory): convert into the shared scratch buffer.
-     * Valid until the next uncached conversion, which is enough because callers
-     * consume the pointer within a single kernel invocation. */
+    /* Use shared scratch storage for uncached weights. */
     if (scratch_n < n) {
         granite_device_free(scratch);
         scratch = granite_device_alloc(bytes);
@@ -429,13 +394,8 @@ static const float *bf16_as_f32(const uint16_t *src, size_t n) {
     return out;
 }
 
-/* ========================================================================
- * Linear
- * ======================================================================== */
 
-/* Broadcast-add a bias row across every frame of a GEMM result. Threaded for
- * the same reason every other kernel here is: it runs over the largest buffer
- * in the model (seq * FF_INNER) and a serial pass caps the whole backend. */
+/* Add one bias row to every frame of a GEMM result. */
 typedef struct {
     float *y;
     const float *bias;
@@ -507,7 +467,7 @@ static void linear_worker(int tid, int n_threads, void *arg) {
         }
     }
 }
-#endif /* !USE_BLAS */
+#endif
 
 void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
                          const uint16_t *b, int seq, int in_dim, int out_dim) {
@@ -525,30 +485,15 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
     }
 
 #ifdef USE_MPS
-    /* Falls through to the CPU path if the shape is too small to be worth a
-     * dispatch, or if an operand could not be resolved to a device buffer.
-     *
-     * The bias stays inside the Metal path (prefilled into C, beta=1) rather
-     * than moving to add_bias_rows like the BLAS path below. Leave it. The
-     * prefill is the CPU touching every page of the result before the GPU
-     * writes it, and without it the CPU reads
-     * back stale contents for part of the output, silently, with the command
-     * buffer reporting success. It only shows up once a buffer lands on
-     * recycled rather than fresh (zero-filled) pages, so a whole-clip decode
-     * looks fine and the second segment of a segmented decode fills with NaN.
-     * Removing it cost a measured 0.03 s and two hours; leave it alone. */
+    /* Fall back to CPU for small shapes or unregistered operands. Metal keeps
+     * the bias prefill because it also initializes GPU-written pages. */
     if (granite_metal_should_offload(seq, in_dim, out_dim) &&
         granite_metal_linear(y, x, Wf, bias, seq, in_dim, out_dim))
         goto done;
 #endif
 
 #ifdef USE_BLAS
-    /* beta = 0 and a separate bias pass, rather than broadcasting the bias into
-     * C and letting sgemm accumulate onto it. The latter makes BLAS read C back
-     * as an input, and the broadcast itself is a serial write over the whole
-     * seq * out_dim output. On the FF1 shape that measured 17.1 ms against
-     * 13.4 ms for the bare GEMM. The bias add is the same sum in the same order,
-     * so the result is unchanged. */
+    /* beta=0 avoids reading C; add the bias in a separate parallel pass. */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq, out_dim, in_dim, 1.0f,
                 x, in_dim, Wf, in_dim,
@@ -565,9 +510,6 @@ done:
     if (bias && bias != bias_stack) free(bias);
 }
 
-/* ========================================================================
- * Normalization
- * ======================================================================== */
 
 typedef struct {
     float *out;
@@ -659,20 +601,8 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
     free(scale);
 }
 
-/* ========================================================================
- * Activations
- * ======================================================================== */
 
-/*
- * These three were all serial and all bottlenecked on scalar expf, which the
- * profile charged ~287 samples, more than layer norm. Per layer the encoder
- * evaluates roughly T * 12288 exponentials across two SiLUs, the conv SiLU and
- * the GLU, so at T = 1490 that is ~290M over 16 layers.
- *
- * Two fixes, both parity-safe: thread over the outer axis, and evaluate exp in
- * tiles through Accelerate's vForce, which is sub-ULP. The scalar fallback keeps
- * Linux and non-BLAS builds working.
- */
+/* Thread activation work and use vForce exp where available. */
 #define EW_TILE 512
 
 static void exp_tile(float *dst, const float *src, int n) {
@@ -732,7 +662,7 @@ static void softmax_worker(int tid, int n_threads, void *arg) {
             for (int j = 0; j < m; j++) shifted[j] = row[c + j] - mx;
             exp_tile(row + c, shifted, m);
         }
-        /* Summed in index order, matching the original scalar loop. */
+        /* Preserve the reference's accumulation order. */
         float sum = 0.0f;
         for (int c = 0; c < a->cols; c++) sum += row[c];
         float inv = 1.0f / sum;
@@ -777,9 +707,6 @@ void granite_glu(float *out, const float *x, int seq, int half) {
     parallel_for(glu_worker, &a);
 }
 
-/* ========================================================================
- * Depthwise conv1d
- * ======================================================================== */
 
 typedef struct {
     float *out;
@@ -815,15 +742,11 @@ void granite_depthwise_conv1d_bf16(float *out, const float *x, const uint16_t *w
     const float *wf = bf16_as_f32(w, (size_t)channels * kernel);
     if (!wf) return;
 
-    /* Output frames are independent (each reads a k-wide window of x and writes
-     * its own row), so this threads with no coordination. */
+    /* Output rows are independent, so the convolution is safe to thread. */
     dw_args_t args = { out, x, wf, seq, channels, kernel, stride, pad_l, out_seq };
     parallel_for(dw_worker, &args);
 }
 
-/* ========================================================================
- * Block-local attention with Shaw relative-position bias
- * ======================================================================== */
 
 typedef struct {
     float *out;
@@ -852,8 +775,7 @@ typedef struct {
  */
 #define QBLK 4
 
-/* Softmax over one score row, then out = sum_j p_j * v_j. Shared by both the
- * blocked and the single-query paths so they cannot drift apart. */
+/* Normalize one score row and apply it to the values. */
 static void attn_row_finish(float *row, int L, float *oi, const float *v,
                             int off, int inner, int hoff, int D) {
     float mx = -INFINITY;
@@ -881,8 +803,7 @@ static void attn_row_finish(float *row, int L, float *oi, const float *v,
     }
 }
 
-/* Scores for a single query row: the original inner loop, kept for the tail of
- * a block whose length is not a multiple of QBLK. */
+/* Score one query row for a short tail. */
 static void attn_row_scores(const attn_args_t *a, float *row, int i,
                             int off, int inner, int hoff) {
     const int L = a->block_len, D = a->dim_head;
@@ -910,9 +831,7 @@ static void attn_row_scores(const attn_args_t *a, float *row, int i,
     }
 }
 
-/* Scores for QBLK consecutive query rows. The u loops are bounded by the
- * literal QBLK so they unroll and the 2 * QBLK accumulators stay in registers;
- * with a runtime bound they spill and the whole point is lost. */
+/* Score QBLK query rows together; keep QBLK literal for register allocation. */
 static void attn_scores_x4(const attn_args_t *a, float *scores, int i0,
                            int off, int inner, int hoff) {
     const int L = a->block_len, D = a->dim_head;

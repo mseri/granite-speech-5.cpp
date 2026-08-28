@@ -1,10 +1,4 @@
-/*
- * granite.h - Public API for Granite Speech 5.0 CTC inference
- *
- * Encoder-only CTC model: audio -> log-mel(+delta) front-end -> conformer
- * encoder -> CTC head -> greedy collapse -> text. There is no autoregressive
- * decoder, no KV cache and no sampling.
- */
+/* Public API for Granite Speech 5.0 CTC inference. */
 
 #ifndef GRANITE_H
 #define GRANITE_H
@@ -15,9 +9,6 @@
 #include "granite_audio.h"
 #include "granite_safetensors.h"
 
-/* ========================================================================
- * Model hyper-parameters (granite-speech-5.0/config.json)
- * ======================================================================== */
 
 #define GRANITE_INPUT_DIM      320   /* n_mels * 2 (deltas) * stack_factor */
 #define GRANITE_NUM_LAYERS      16
@@ -37,9 +28,6 @@
 /* CTC blank shares id 0 with the tokenizer's <unk>. */
 #define GRANITE_BLANK_ID 0
 
-/* ========================================================================
- * Front-end parameters (preprocessor_config.json)
- * ======================================================================== */
 
 #define GRANITE_SAMPLE_RATE    16000
 #define GRANITE_N_FFT            512
@@ -54,12 +42,8 @@
 #define GRANITE_SAMPLES_PER_FRAME \
     (GRANITE_HOP_LENGTH * GRANITE_STACK_FACTOR * 4)
 
-/* ========================================================================
- * Weights
- * ======================================================================== */
 
-/* All weights are bf16 in the checkpoint and stay mmap'd; the BatchNorm
- * running statistics are the only f32 tensors. */
+/* Checkpoint weights are bf16; BatchNorm statistics are f32. */
 typedef struct {
     const uint16_t *norm_ff1_w,  *norm_ff1_b;      /* [HIDDEN] LayerNorm */
     const uint16_t *ff1_l1_w,    *ff1_l1_b;        /* [4H, H] / [4H] */
@@ -93,9 +77,6 @@ typedef struct {
     const uint16_t *out_mid_w, *out_mid_b;            /* [H, VOCAB] mid-injection */
 } granite_weights_t;
 
-/* ========================================================================
- * Model handle
- * ======================================================================== */
 
 struct granite_tokenizer;
 
@@ -113,22 +94,13 @@ typedef struct {
     int verbose;
 } granite_model_t;
 
-/* ========================================================================
- * API
- * ======================================================================== */
 
 /* Load model from a directory containing model.safetensors + tokenizer.json. */
 granite_model_t *granite_load(const char *model_dir, int verbose);
 void granite_free(granite_model_t *m);
 
-/* ========================================================================
- * Runtime parameters
- * ======================================================================== */
 
-/* Attention is block-local over GRANITE_CONTEXT_SIZE encoder frames, and an
- * encoder frame is 80 ms, so one attention block spans ~10.2 s. That is the
- * model's effective receptive field and the floor for any chunk length: cutting
- * below it degrades accuracy, which is why the minimums here are what they are. */
+/* One attention block is the model's ~10.2 s receptive field. */
 #define GRANITE_BLOCK_SECONDS \
     ((float)GRANITE_CONTEXT_SIZE * GRANITE_SAMPLES_PER_FRAME / GRANITE_SAMPLE_RATE)
 
@@ -153,23 +125,13 @@ typedef void (*granite_text_cb)(const char *delta, void *user);
  * Returns a malloc'd UTF-8 string the caller must free, or NULL on error. */
 char *granite_transcribe(granite_model_t *m, const float *samples, int n_samples);
 
-/* Segmented transcription: split the audio at low-energy points near each
- * nominal boundary and decode the pieces independently.
- *
- * This bounds the size of individual allocations. A whole-clip decode needs one
- * contiguous n_frames * 16384 float buffer for the logits, which is ~1.4 GB per
- * 30 minutes and can simply fail to allocate. It does not meaningfully lower
- * peak RSS: the bf16 -> f32 weight cache dominates that (measured 3.0 GB
- * whole-clip against 3.1 GB segmented on 30 minutes of audio).
- *
- * With p->segment_sec == 0 this is exactly granite_transcribe. */
+/* Decode independently at low-energy points near nominal boundaries. A zero
+ * segment length uses the regular whole-clip decode. */
 char *granite_transcribe_segmented(granite_model_t *m, const float *samples,
                                    int n_samples, const granite_params_t *p,
                                    granite_text_cb cb, void *user);
 
-/* Streaming transcription from a live source. Re-encodes a sliding window as
- * audio arrives and commits frames older than the lookahead, so committed text
- * never changes retroactively. Returns the full transcript. */
+/* Decode a sliding window as audio arrives; committed text is not revised. */
 char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
                                 const granite_params_t *p,
                                 granite_text_cb cb, void *user);
@@ -194,4 +156,4 @@ void granite_logits_free(float *logits);
  * success, -1 if any tensor is missing or has an unexpected dtype. */
 int granite_bind_weights(granite_weights_t *w, const multi_safetensors_t *ms);
 
-#endif /* GRANITE_H */
+#endif

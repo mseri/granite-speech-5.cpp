@@ -1,20 +1,4 @@
-/*
- * granite_kernels_metal.h - Metal/MPS backend (Apple Silicon)
- *
- * C-callable interface; safe to include from plain C translation units.
- * Implementation is in granite_kernels_metal.m (Objective-C + MPS).
- *
- * Only the linears are offloaded, via MPSMatrixMultiplication. Attention, norms,
- * GLU, SiLU and the depthwise conv stay on the CPU. For the elementwise kernels
- * a dispatch round-trip would cost more than it saves; for attention it was
- * measured, and a hand-written shader lost to the CPU kernel by roughly 4x on an
- * M1 (1.00 s against 0.27 s over a 119 s clip).
- *
- * The design point that makes this worthwhile is that activations and the
- * bf16 -> f32 weight cache are allocated *as* Metal shared buffers, so the GPU
- * reads the same bytes the CPU wrote. There is no per-call upload of a 16 MB
- * weight matrix and no second copy of the 1.8 GB weight cache.
- */
+/* C interface to the Apple Silicon Metal/MPS backend. */
 
 #ifndef GRANITE_KERNELS_METAL_H
 #define GRANITE_KERNELS_METAL_H
@@ -22,50 +6,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---------------------------------------------------------------- lifecycle -- */
 
-/*
- * Stderr verbosity, which exists to keep the user-facing output contract:
- * without --debug stderr is one summary line, and --silent quiets it entirely.
- *
- *   0  say nothing
- *   1  warnings only: no device, queue creation failure (the default; these
- *      are worth a line because an MPS build silently running on the CPU is a
- *      real problem, and in the normal case nothing is printed)
- *   2  also report the device being used
- *
- * Must be set before the first call into the backend to have any effect on
- * init-time messages.
- */
+
+/* Set backend diagnostics: 0 silent, 1 warnings, 2 includes the device name.
+ * Set it before initialization. */
 void granite_metal_set_verbose(int level);
 
-/* Bring up the device and command queue. Idempotent and thread-safe;
- * safe to call before every other function here. */
+/* Initialize the device and command queue. Safe to call repeatedly. */
 void granite_metal_init(void);
 
-/* Release every Metal resource, including registered buffers. Pointers handed
- * out by granite_metal_alloc() are dangling afterwards.
- *
- * Nothing in the CLI path calls this: device state is process-lifetime, exactly
- * like the bf16 -> f32 weight cache it backs, and both are reclaimed at exit.
- * It exists for embedders that load and unload a model inside a longer-lived
- * process. */
+/* Release Metal resources. Allocated pointers become invalid. */
 void granite_metal_shutdown(void);
 
 /* 1 once init has succeeded, 0 if there is no usable Metal device. */
 int granite_metal_available(void);
 
-/* ------------------------------------------------------------------ memory -- */
 
-/*
- * Allocate `bytes` of shared (CPU+GPU) storage and return a host pointer to it.
- * The backing MTLBuffer is registered, so any pointer into this range is
- * recognized later by the GEMM entry point and used in place without a staging
- * copy.
- *
- * Returns NULL if Metal is unavailable or the allocation fails; callers are
- * expected to fall back to malloc.
- */
+
+/* Allocate shared CPU/GPU storage and return its host pointer, or NULL. */
 void *granite_metal_alloc(size_t bytes);
 
 /* Free a pointer obtained from granite_metal_alloc(). Returns 1 if `p` was a
@@ -73,13 +31,13 @@ void *granite_metal_alloc(size_t bytes);
  * case the caller still owns it and should free() it. NULL returns 0. */
 int granite_metal_dealloc(void *p);
 
-/* ----------------------------------------------------------------- dispatch -- */
+
 
 /* 1 when a seq x in_dim x out_dim linear is worth a GPU dispatch. Small
  * matrices lose to dispatch latency even on unified memory. */
 int granite_metal_should_offload(int seq, int in_dim, int out_dim);
 
-/* -------------------------------------------------------------------- gemm -- */
+
 
 /*
  * y[seq, out_dim] = x[seq, in_dim] @ W[out_dim, in_dim]^T + bias[out_dim]
@@ -92,4 +50,4 @@ int granite_metal_should_offload(int seq, int in_dim, int out_dim);
 int granite_metal_linear(float *y, const float *x, const float *W,
                          const float *bias, int seq, int in_dim, int out_dim);
 
-#endif /* GRANITE_KERNELS_METAL_H */
+#endif

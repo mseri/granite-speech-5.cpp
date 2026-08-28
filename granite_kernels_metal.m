@@ -1,21 +1,4 @@
-/*
- * granite_kernels_metal.m - Metal/MPS backend for Granite Speech 5.0
- *
- * See granite_kernels_metal.h for the contract. Notes on the parts that are
- * easy to get wrong:
- *
- * Buffer residency. Activations and the bf16 -> f32 weight cache are allocated
- * through granite_metal_alloc(), which hands back the `contents` pointer of a
- * MTLResourceStorageModeShared buffer and records the range in `reg`. Every
- * GEMM then resolves its operands to (buffer, offset) by range lookup, so the
- * common case moves no bytes at all. The front-end features are the only
- * operand that is ever unregistered, and they get staged.
- *
- * All entry points are called from the single thread that drives the encoder,
- * so the registry and the staging slots need no locking. granite_metal_alloc()
- * is the exception, since it is reachable from the weight cache under its own
- * mutex, so it takes `g_lock`.
- */
+/* Metal/MPS backend. Shared buffers let GEMMs use cached weights in place. */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -28,9 +11,6 @@
 
 #include "granite_kernels_metal.h"
 
-/* ========================================================================
- * Device state
- * ======================================================================== */
 
 static id<MTLDevice>              g_device = nil;
 static id<MTLCommandQueue>        g_queue  = nil;
@@ -39,13 +19,7 @@ static int                        g_verbose = 1;
 static dispatch_once_t            g_once;
 static pthread_mutex_t            g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * MPSMatrixMultiplication compiles a kernel for its shape on construction, so
- * building a fresh one per call charged that to every layer. The encoder only
- * ever uses a handful of distinct (seq, in_dim, out_dim) triples, since the
- * frame count only changes at the two subsampling blocks, so a tiny cache
- * removes essentially all of the churn.
- */
+/* MPS compiles each matrix shape once; cache the shapes used by the encoder. */
 #define MM_SLOTS 16
 static struct {
     int seq, in_dim, out_dim, has_bias;
@@ -54,16 +28,8 @@ static struct {
 } g_mm[MM_SLOTS];
 static int g_mm_count = 0;
 
-/* ------------------------------------------------------- buffer registry --- */
 
-/*
- * Ownership is deliberately split. `g_owned` holds the only strong references;
- * the registry array holds __unsafe_unretained aliases so the struct stays
- * trivially copyable and can be realloc'd and swap-removed as plain memory.
- * A strong field here would mean every realloc and every swap-remove had to
- * cooperate with ARC's release-the-old-value semantics, which is exactly the
- * kind of subtlety that turns into a double release later.
- */
+/* Keep strong buffer references separately; registry entries are non-owning. */
 typedef struct {
     void                            *base;
     size_t                           len;
@@ -107,7 +73,7 @@ static id<MTLBuffer> reg_find(const void *p, size_t bytes, size_t *offset) {
     return nil;
 }
 
-/* ------------------------------------------------------------ staging pool -- */
+
 
 /* One slot per GEMM operand that might not be resident: 0=x, 1=W, 2=y. In
  * practice only x is ever staged (the front-end features); weights and
@@ -135,9 +101,7 @@ static id<MTLBuffer> stage_buf(int slot, size_t bytes) {
     return b;
 }
 
-/* Resolve an operand: use it in place when resident, otherwise copy it into a
- * staging slot. `copy_in` is 0 for pure outputs, whose contents are irrelevant.
- * Sets *offset and returns nil on failure. */
+/* Resolve a resident operand or copy it to a staging slot. */
 static id<MTLBuffer> operand(const void *p, size_t bytes, int slot, int copy_in,
                              size_t *offset) {
     id<MTLBuffer> b = reg_find(p, bytes, offset);
@@ -145,11 +109,7 @@ static id<MTLBuffer> operand(const void *p, size_t bytes, int slot, int copy_in,
      * hand it is row-aligned, but check rather than assume. */
     if (b && (*offset % 16) == 0) return b;
 
-    /* Not resident. Staging is for small strays like the front-end features; a
-     * large operand landing here means granite_device_alloc fell back to
-     * malloc, and mirroring hundreds of MB into a second buffer is worse than
-     * just running this GEMM on the CPU. The 30-minute logits buffer
-     * (n_frames * 16384 floats, ~1.4 GB) is the case this guards. */
+    /* Stage small unregistered operands; large ones fall back to the CPU. */
     if (bytes > (256u << 20)) return nil;
 
     b = stage_buf(slot, bytes);
@@ -159,9 +119,6 @@ static id<MTLBuffer> operand(const void *p, size_t bytes, int slot, int copy_in,
     return b;
 }
 
-/* ========================================================================
- * Lifecycle
- * ======================================================================== */
 
 static int metal_linear(float *y, const float *x, const float *W,
                         const float *bias, int seq, int in_dim, int out_dim);
@@ -189,9 +146,7 @@ void granite_metal_init(void) {
             fprintf(stderr, "[metal] using device: %s\n",
                     [[g_device name] UTF8String]);
 
-        /* Warm the MPS GEMM so its shader JIT is not charged to the first
-         * layer. Must call metal_linear directly: granite_metal_linear would
-         * re-enter the dispatch_once we are inside. */
+        /* Compile a representative GEMM before the first real layer. */
         enum { WM = 128, WK = 512, WN = 512 };
         float *a = calloc((size_t)WM * WK, sizeof(float));
         float *b = calloc((size_t)WN * WK, sizeof(float));
@@ -223,9 +178,6 @@ void granite_metal_shutdown(void) {
 
 int granite_metal_available(void) { return g_available; }
 
-/* ========================================================================
- * Memory
- * ======================================================================== */
 
 void *granite_metal_alloc(size_t bytes) {
     granite_metal_init();
@@ -235,8 +187,7 @@ void *granite_metal_alloc(size_t bytes) {
     id<MTLBuffer> b = [g_device newBufferWithLength:bytes
                                            options:MTLResourceStorageModeShared];
     void *p = b ? [b contents] : NULL;
-    /* If the range cannot be recorded, refuse: an unregistered pointer would
-     * still work, but every GEMM touching it would stage a copy. */
+    /* Unregistered buffers would be staged on every GEMM, so reject them. */
     if (p && !reg_add(p, bytes, b)) p = NULL;
     pthread_mutex_unlock(&g_lock);
     return p;
@@ -257,30 +208,22 @@ int granite_metal_dealloc(void *p) {
     return 0;
 }
 
-/* ========================================================================
- * Dispatch policy
- * ======================================================================== */
 
 int granite_metal_should_offload(int seq, int in_dim, int out_dim) {
     if (!g_available) return 0;
     if (seq <= 1) return 0;
-    /* Below a few MFLOPs the dispatch round-trip dominates. Every linear in
-     * this model clears this except on sub-second clips. */
+    /* Small matrices are faster on the CPU because dispatch overhead dominates. */
     return (long long)seq * in_dim * out_dim * 2 >= 8000000LL;
 }
 
-/* ========================================================================
- * GEMM
- * ======================================================================== */
 
-/* beta differs between the bias and no-bias cases, and it is baked into the
- * MPSMatrixMultiplication at construction, so it is part of the key. */
+/* The bias-dependent beta value is fixed when MPS creates the operation. */
 static int mm_slot(int seq, int in_dim, int out_dim, int has_bias) {
     for (int i = 0; i < g_mm_count; i++)
         if (g_mm[i].seq == seq && g_mm[i].in_dim == in_dim &&
             g_mm[i].out_dim == out_dim && g_mm[i].has_bias == has_bias)
             return i;
-    if (g_mm_count == MM_SLOTS) g_mm_count = 0;   /* wrap; shapes recur in cycles */
+    if (g_mm_count == MM_SLOTS) g_mm_count = 0;   /* reuse an old slot */
     int i = g_mm_count++;
 
     g_mm[i].seq = seq; g_mm[i].in_dim = in_dim; g_mm[i].out_dim = out_dim;
@@ -309,9 +252,7 @@ static int mm_slot(int seq, int in_dim, int out_dim, int has_bias) {
     return i;
 }
 
-/* Body of granite_metal_linear, minus the init. Kept separate so the warm-up
- * inside granite_metal_init() can reach it without re-entering dispatch_once,
- * which would deadlock. */
+/* Linear implementation without initialization, used by the startup warm-up. */
 static int metal_linear(float *y, const float *x, const float *W,
                         const float *bias, int seq, int in_dim, int out_dim) {
     const size_t sx = (size_t)seq * in_dim * sizeof(float);
@@ -321,16 +262,12 @@ static int metal_linear(float *y, const float *x, const float *W,
     size_t ox = 0, oW = 0, oy = 0;
     id<MTLBuffer> bx = operand(x, sx, 0, /*copy_in=*/1, &ox);
     id<MTLBuffer> bW = operand(W, sW, 1, /*copy_in=*/1, &oW);
-    /* y is written, not read, except that the bias prefill below seeds it, and
-     * that happens directly in whichever buffer it lands in. */
+    /* The bias prefill is the only read of y. */
     id<MTLBuffer> by = operand(y, sy, 2, /*copy_in=*/0, &oy);
     if (!bx || !bW || !by) return 0;
 
-    /* Bias goes in as beta=1 on a prefilled C. The BLAS path deliberately does
-     * the opposite (beta=0 plus a separate add), but do not copy that here: the
-     * prefill is also the CPU touching every page of the result before the GPU
-     * writes it, and without it the CPU reads back stale contents for part of
-     * the output. See the long comment in granite_linear_bf16. */
+    /* Prefill C with bias: MPS uses beta=1, and touching the pages avoids stale
+     * contents when the GPU writes the result. */
     float *yd = (float *)((char *)[by contents] + oy);
     if (bias) {
         for (int i = 0; i < seq; i++)

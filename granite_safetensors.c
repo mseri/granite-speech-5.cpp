@@ -1,7 +1,4 @@
-/*
- * granite_safetensors.c - Safetensors reader with multi-shard support
- * Adapted from the qwen-asr project.
- */
+/* Memory-mapped safetensors reader with multi-shard support. */
 
 #include "granite_safetensors.h"
 #include <stdio.h>
@@ -13,9 +10,6 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
-/* ========================================================================
- * Minimal JSON parser for safetensors header
- * ======================================================================== */
 
 static void skip_whitespace(const char **p) {
     while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++;
@@ -116,7 +110,7 @@ static int parse_tensor_entry(const char **p, safetensor_t *t) {
             skip_whitespace(p);
             if (**p == ']') (*p)++;
         } else {
-            /* Skip unknown value */
+            /* Ignore unknown metadata values. */
             if (**p == '"') {
                 (*p)++;
                 while (**p && **p != '"') {
@@ -187,9 +181,6 @@ static int parse_header(safetensors_file_t *sf) {
     return 0;
 }
 
-/* ========================================================================
- * Single file operations
- * ======================================================================== */
 
 safetensors_file_t *safetensors_open(const char *path) {
     int fd = open(path, O_RDONLY);
@@ -302,9 +293,6 @@ void safetensors_print_all(const safetensors_file_t *sf) {
     for (int i = 0; i < sf->num_tensors; i++) safetensor_print(&sf->tensors[i]);
 }
 
-/* ========================================================================
- * Multi-shard operations
- * ======================================================================== */
 
 multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     multi_safetensors_t *ms = calloc(1, sizeof(multi_safetensors_t));
@@ -312,7 +300,7 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
 
     char path[4096];
 
-    /* Single file first */
+    /* Prefer a single model file. */
     snprintf(path, sizeof(path), "%s/model.safetensors", model_dir);
     safetensors_file_t *sf = safetensors_open(path);
     if (sf) {
@@ -321,8 +309,7 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         return ms;
     }
 
-    /* Otherwise scan for model-*.safetensors shards; the total count is not
-     * known up front, so the directory listing is the only way to find them. */
+    /* Otherwise discover model shards from the directory. */
     DIR *dir = opendir(model_dir);
     if (!dir) { free(ms); return NULL; }
 
@@ -346,7 +333,7 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
         return NULL;
     }
 
-    /* Sorted so shard order is consistent across runs. */
+    /* Sort for deterministic shard order. */
     qsort(shard_names, n_shards, 256, (int(*)(const void*,const void*))strcmp);
 
     for (int i = 0; i < n_shards; i++) {

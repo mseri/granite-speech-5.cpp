@@ -1,7 +1,4 @@
-/*
- * granite_safetensors.h - Safetensors file format reader (memory-mapped)
- * Adapted from the qwen-asr project.
- */
+/* Memory-mapped safetensors reader with multi-shard support. */
 
 #ifndef GRANITE_SAFETENSORS_H
 #define GRANITE_SAFETENSORS_H
@@ -41,32 +38,32 @@ typedef struct {
     safetensor_t tensors[SAFETENSORS_MAX_TENSORS];
 } safetensors_file_t;
 
-/* Multi-shard wrapper: opens all shard files and provides unified tensor lookup */
+/* Unified tensor lookup across multiple shards. */
 typedef struct {
     safetensors_file_t *shards[SAFETENSORS_MAX_SHARDS];
     int num_shards;
 } multi_safetensors_t;
 
-/* Open a single safetensors file (memory-mapped) */
+/* Open a memory-mapped safetensors file. */
 safetensors_file_t *safetensors_open(const char *path);
 void safetensors_close(safetensors_file_t *sf);
 
-/* Open model from directory (auto-detects single file or multi-shard) */
+/* Open a model directory, detecting single-file or sharded models. */
 multi_safetensors_t *multi_safetensors_open(const char *model_dir);
 void multi_safetensors_close(multi_safetensors_t *ms);
 
-/* Find a tensor by name across all shards */
+/* Find a tensor by name across all shards. */
 const safetensor_t *multi_safetensors_find(const multi_safetensors_t *ms,
                                             const char *name,
                                             safetensors_file_t **out_sf);
 
-/* Get raw pointer to tensor data (within mmap'd region) */
+/* Return a pointer to tensor data in the mapped file. */
 const void *safetensors_data(const safetensors_file_t *sf, const safetensor_t *t);
 
-/* Get tensor data as float32 (allocates, caller must free) */
+/* Copy tensor data as float32; caller frees the result. */
 float *safetensors_get_f32(const safetensors_file_t *sf, const safetensor_t *t);
 
-/* Get direct pointer to bf16 data in mmap'd region (no copy) */
+/* Return the mapped bf16 data without copying. */
 uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safetensor_t *t);
 
 int safetensor_is_bf16(const safetensor_t *t);
@@ -74,4 +71,4 @@ int64_t safetensor_numel(const safetensor_t *t);
 void safetensor_print(const safetensor_t *t);
 void safetensors_print_all(const safetensors_file_t *sf);
 
-#endif /* GRANITE_SAFETENSORS_H */
+#endif

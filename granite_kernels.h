@@ -1,9 +1,4 @@
-/*
- * granite_kernels.h - Math kernels for Granite Speech 5.0 inference
- *
- * All activations are row-major float32. Weights arrive as bf16 (uint16_t)
- * straight out of the mmap'd checkpoint and are converted on demand.
- */
+/* Math kernels for Granite Speech 5.0 inference. */
 
 #ifndef GRANITE_KERNELS_H
 #define GRANITE_KERNELS_H
@@ -11,21 +6,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ------------------------------------------------------------- threading --- */
 
 void granite_set_threads(int n);
 int granite_get_num_cpus(void);
 void granite_kernels_shutdown(void);
 
-/* Cap (in bytes) on the bf16 -> f32 weight cache. 0 means "no cache": every
- * linear converts into a scratch buffer. Defaults to 3 GiB, enough to hold the
- * whole 473M-param model as f32. */
+/* Set the bf16-to-f32 weight-cache limit; zero disables caching. */
 void granite_set_weight_cache_limit(size_t bytes);
 
 /* Bytes currently held by the bf16 -> f32 weight cache. */
 size_t granite_weight_cache_bytes(void);
 
-/* ------------------------------------------------------------- allocation --- */
 
 /* Allocate a buffer for weights or activations. Under the Metal backend this
  * comes from GPU-visible shared memory, so kernels read the same bytes the CPU
@@ -36,15 +27,12 @@ size_t granite_weight_cache_bytes(void);
 void *granite_device_alloc(size_t bytes);
 void granite_device_free(void *p);
 
-/* ---------------------------------------------------------------- basics --- */
 
 void granite_add_inplace(float *a, const float *b, int n);
 void granite_scale(float *x, float s, int n);
 float granite_bf16_to_f32(uint16_t h);
 
-/* a += s * b. Threaded above ~32 Ki elements; the encoder's per-layer residual
- * adds run over the whole T * HIDDEN activation and are not cheap enough to
- * leave on one thread. */
+/* Compute a += s * b. */
 void granite_add_scaled_inplace(float *a, const float *b, float s, int n);
 
 /* Subsampling residual: out[t] = 0.5 * (x[2t] + x[2t+1]) + proj[t], for
@@ -52,13 +40,11 @@ void granite_add_scaled_inplace(float *a, const float *b, float s, int n);
 void granite_subsample_pool_add(float *out, const float *x, const float *proj,
                                 int t_half, int hidden);
 
-/* ---------------------------------------------------------------- linear --- */
 
 /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out]. `b` may be NULL. */
 void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
                          const uint16_t *b, int seq, int in_dim, int out_dim);
 
-/* ------------------------------------------------------------------ norm --- */
 
 /* LayerNorm over the last dim, with bf16 affine params. `out` may alias `x`. */
 void granite_layer_norm_bf16(float *out, const float *x, const uint16_t *w,
@@ -70,7 +56,6 @@ void granite_batch_norm_bf16(float *x, const uint16_t *w, const uint16_t *b,
                              const float *mean, const float *var,
                              int seq, int channels, float eps);
 
-/* ----------------------------------------------------------- activations --- */
 
 void granite_silu(float *x, int n);
 void granite_softmax_rows(float *x, int rows, int cols);
@@ -79,7 +64,6 @@ void granite_softmax_rows(float *x, int rows, int cols);
  * [a (half) | b (half)]. Operates out-of-place. */
 void granite_glu(float *out, const float *x, int seq, int half);
 
-/* ------------------------------------------------------------------ conv --- */
 
 /* Depthwise 1-D convolution, time-major in/out.
  * x:   [seq, ch]
@@ -109,4 +93,4 @@ void granite_block_attention(float *out, const float *q, const float *k,
                              const uint16_t *rel_pos_emb,
                              const int32_t *dists, int ctx);
 
-#endif /* GRANITE_KERNELS_H */
+#endif

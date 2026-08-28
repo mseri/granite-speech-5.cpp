@@ -1,6 +1,4 @@
-/*
- * main.c - CLI for granite.cpp
- */
+/* Command-line interface for Granite Speech inference. */
 
 #include "granite.h"
 #include "granite_audio.h"
@@ -43,8 +41,7 @@ static void usage(const char *prog) {
         prog);
 }
 
-/* Run the pipeline stepwise, writing each stage to DIR as raw float32 so
- * test_granite.py can diff against reference.py's tensors. */
+/* Run the pipeline and optionally dump raw f32 features and logits. */
 static char *transcribe_and_dump(granite_model_t *m, const float *samples,
                                  int n_samples, const char *dir) {
     int n_frames = 0;
@@ -85,7 +82,7 @@ static char *transcribe_and_dump(granite_model_t *m, const float *samples,
     return text;
 }
 
-/* Streaming callback: newly committed text, printed as it stabilizes. */
+/* Print newly committed streaming text. */
 static void emit_delta(const char *delta, void *user) {
     (void)user;
     fputs(delta, stdout);
@@ -156,8 +153,7 @@ int main(int argc, char **argv) {
     granite_set_threads(threads > 0 ? threads : granite_get_num_cpus());
 
 #ifdef USE_MPS
-    /* Keep the stderr contract: nothing extra by default, the device name only
-     * under --debug, and silence under --silent. Must precede granite_load. */
+    /* Configure diagnostics before loading the model. */
     granite_metal_set_verbose(silent ? 0 : (debug ? 2 : 1));
 #endif
 
@@ -166,8 +162,7 @@ int main(int argc, char **argv) {
     if (!m) return 1;
     double t_load = now_sec() - t0;
 
-    /* Streaming reads incrementally and prints as it commits, so it never
-     * materializes the whole clip. */
+    /* Streaming decodes incrementally and prints committed text. */
     if (stream) {
         granite_live_audio_t *la = granite_live_audio_start_stdin();
         if (!la) {
@@ -213,7 +208,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* --silent still prints the transcription; it only quiets stderr. */
+    /* --silent suppresses status output, not the transcription. */
     printf("%s\n", text);
 
     if (!silent) {

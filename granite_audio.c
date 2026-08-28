@@ -1,16 +1,4 @@
-/*
- * granite_audio.c - WAV loading and the log-mel(+delta) front-end
- *
- * The front-end reproduces processing_ctc_conformer.CtcConformerProcessor,
- * which is torchaudio's MelSpectrogram at its default settings followed by a
- * log10 / floor / rescale, delta features, and 2-frame stacking. The torchaudio
- * defaults that matter here:
- *   - window   Hann(win_length=400, periodic), zero-padded to n_fft=512 and
- *              centred at offset (512-400)/2 = 56
- *   - stft     center=True with reflect padding of n_fft/2, power=2.0
- *   - fbanks   HTK mel scale, f_min=0, f_max=sr/2, norm=None
- *   - deltas   win_length=3, replicate padding, denominator 2
- */
+/* Audio loading and the Granite Speech 5.0 log-mel feature extractor. */
 
 #include "granite_audio.h"
 #include "granite.h"
@@ -25,9 +13,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ========================================================================
- * WAV
- * ======================================================================== */
 
 static uint32_t rd_u32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -38,9 +23,7 @@ static uint16_t rd_u16(const uint8_t *p) {
     return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8));
 }
 
-/* Linear-interpolation resampler. The parity-tested path is 16 kHz input,
- * where this is a no-op; other rates are resampled approximately (torchaudio
- * would use windowed sinc). */
+/* Linear-interpolation resampler; 16 kHz input takes the copy path. */
 static float *resample_linear(const float *in, int n_in, int sr_in, int sr_out,
                               int *out_n) {
     if (sr_in == sr_out) {
@@ -177,9 +160,6 @@ float *granite_read_stdin(int *out_n_samples) {
     return out;
 }
 
-/* ========================================================================
- * Live audio (stdin reader thread)
- * ======================================================================== */
 
 struct granite_live_audio {
     float *buf;
@@ -204,7 +184,7 @@ static void live_append(granite_live_audio_t *la, const float *src, int n) {
     pthread_mutex_unlock(&la->mutex);
 }
 
-/* Read exactly n bytes, or fewer at end of stream. */
+/* Read up to n bytes. */
 static size_t read_full(uint8_t *dst, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -215,12 +195,7 @@ static size_t read_full(uint8_t *dst, size_t n) {
     return got;
 }
 
-/* Consume a WAV header from stdin, leaving the stream positioned at the first
- * audio byte. Returns 0 if this was not a WAV (in which case `lead`/`lead_n`
- * hold the bytes already consumed, which are raw audio).
- *
- * Chunk layouts vary: real files put LIST or multi-kilobyte FLLR padding
- * chunks between `fmt ` and `data`, so the data offset cannot be assumed. */
+/* Consume a WAV header, or preserve the leading bytes when input is raw audio. */
 static int consume_wav_header(uint8_t *lead, size_t *lead_n) {
     uint8_t riff[12];
     size_t got = read_full(riff, sizeof(riff));
@@ -235,7 +210,7 @@ static int consume_wav_header(uint8_t *lead, size_t *lead_n) {
         if (read_full(ch, 8) < 8) break;
         uint32_t clen = rd_u32(ch + 4);
 
-        if (memcmp(ch, "data", 4) == 0) break;   /* audio starts here */
+        if (memcmp(ch, "data", 4) == 0) break;
 
         if (memcmp(ch, "fmt ", 4) == 0 && clen >= 16) {
             uint8_t fmt[64];
@@ -249,7 +224,7 @@ static int consume_wav_header(uint8_t *lead, size_t *lead_n) {
                                 "(got %d Hz, %d-bit, %d ch)\n", rate, bits, channels);
             clen -= take;
         }
-        /* Skip the remainder of this chunk (chunks are word-aligned). */
+        /* WAV chunks are padded to an even byte boundary. */
         uint32_t skip = clen + (clen & 1);
         uint8_t sink[4096];
         while (skip > 0) {
@@ -351,9 +326,6 @@ void granite_live_audio_copy(granite_live_audio_t *la, int start, int n, float *
     pthread_mutex_unlock(&la->mutex);
 }
 
-/* ========================================================================
- * Mel filterbank
- * ======================================================================== */
 
 static double hz_to_mel_htk(double f) {
     return 2595.0 * log10(1.0 + f / 700.0);
@@ -368,7 +340,7 @@ float *granite_mel_filterbank(int sample_rate, int n_fft, int n_mels) {
     float *fb = calloc((size_t)n_mels * n_freqs, sizeof(float));
     if (!fb) return NULL;
 
-    /* torchaudio uses linspace(0, sample_rate // 2, n_freqs) for bin centres. */
+    /* Match torchaudio's evenly spaced frequency centres. */
     double f_max = sample_rate / 2;
     double *all_freqs = malloc((size_t)n_freqs * sizeof(double));
     double *f_pts = malloc((size_t)(n_mels + 2) * sizeof(double));
@@ -381,7 +353,7 @@ float *granite_mel_filterbank(int sample_rate, int n_fft, int n_mels) {
     for (int i = 0; i < n_mels + 2; i++)
         f_pts[i] = mel_to_hz_htk(m_min + (m_max - m_min) * i / (n_mels + 1));
 
-    /* Triangular filters: max(0, min(down_slope, up_slope)). */
+    /* Build triangular filters. */
     for (int m = 0; m < n_mels; m++) {
         double d_lo = f_pts[m + 1] - f_pts[m];
         double d_hi = f_pts[m + 2] - f_pts[m + 1];
@@ -398,9 +370,6 @@ float *granite_mel_filterbank(int sample_rate, int n_fft, int n_mels) {
     return fb;
 }
 
-/* ========================================================================
- * FFT (iterative radix-2; n_fft is 512)
- * ======================================================================== */
 
 /* Twiddles are tabulated once from double-precision cos/sin. Deriving them by
  * the usual complex recurrence instead costs ~1e-3 of accuracy in the mel
@@ -448,9 +417,6 @@ static void fft_radix2(float *re, float *im, int n) {
     }
 }
 
-/* ========================================================================
- * Front-end
- * ======================================================================== */
 
 float *granite_frontend(const granite_model_t *m, const float *samples,
                         int n_samples, int *out_frames) {
@@ -471,7 +437,7 @@ float *granite_frontend(const granite_model_t *m, const float *samples,
      * Trimming to `need` here would corrupt the final frames. */
     int siglen = n_samples > need ? n_samples : need;
 
-    /* Reflect-pad by n_fft/2 on both sides for center=True. */
+    /* Center the STFT with reflect padding. */
     int pad = n_fft / 2;
     int padded_n = siglen + 2 * pad;
     float *x = calloc((size_t)padded_n, sizeof(float));
@@ -485,14 +451,14 @@ float *granite_frontend(const granite_model_t *m, const float *samples,
         x[pad + siglen + i] = x[back >= 0 ? back : 0];
     }
 
-    /* Hann(win_length, periodic) centred inside the n_fft buffer. */
+    /* Center the periodic Hann window in the FFT buffer. */
     float window[GRANITE_N_FFT];
     memset(window, 0, sizeof(window));
     int woff = (n_fft - GRANITE_WIN_LENGTH) / 2;
     for (int i = 0; i < GRANITE_WIN_LENGTH; i++)
         window[woff + i] = (float)(0.5 - 0.5 * cos(2.0 * M_PI * i / GRANITE_WIN_LENGTH));
 
-    /* [n_mels, n_frames] log-mel, built transposed for the delta pass. */
+    /* Store log-mel features transposed for the delta pass. */
     float *logmel = malloc((size_t)n_mels * n_frames * sizeof(float));
     float *re = malloc((size_t)n_fft * sizeof(float));
     float *im = malloc((size_t)n_fft * sizeof(float));
@@ -514,14 +480,14 @@ float *granite_frontend(const granite_model_t *m, const float *samples,
 
         for (int b = 0; b < n_mels; b++) {
             const float *filt = m->mel_filters + (size_t)b * n_freqs;
-            double acc = 0.0;   /* f32 accumulation over 257 bins loses ~1e-4 */
+            double acc = 0.0;   /* Match the reference's precision. */
             for (int f = 0; f < n_freqs; f++) acc += (double)filt[f] * power[f];
             logmel[(size_t)b * n_frames + t] = (float)acc;
         }
     }
     free(x); free(re); free(im); free(power);
 
-    /* log10 with a 1e-10 floor, then clamp to (global max - 8 dB), /4 + 1. */
+    /* Apply the reference's floor, clamp, and rescale. */
     float mx = -INFINITY;
     for (size_t i = 0; i < (size_t)n_mels * n_frames; i++) {
         float v = logmel[i] < 1e-10f ? 1e-10f : logmel[i];

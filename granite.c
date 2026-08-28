@@ -1,6 +1,4 @@
-/*
- * granite.c - Model load/free and the end-to-end transcription flow
- */
+/* Model loading and end-to-end transcription. */
 
 #include "granite.h"
 #include "granite_audio.h"
@@ -12,10 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Shaw relative-position index table, matching GraniteSpeechCTCEncoder:
- *   dists[i][j] = clamp(i - j, -context, context) + max_pos_emb
- * With context_size 128 the clamp never binds; the offset centres the range on
- * the 1025-row embedding table. */
+/* Build the Shaw relative-position indices used by the attention layers. */
 static int32_t *build_attention_dists(void) {
     const int c = GRANITE_CONTEXT_SIZE;
     int32_t *d = malloc((size_t)c * c * sizeof(int32_t));
@@ -80,18 +75,14 @@ void granite_free(granite_model_t *m) {
 }
 
 void granite_default_params(granite_params_t *p) {
-    p->segment_sec = 0.0f;              /* whole-clip decode */
+    p->segment_sec = 0.0f;
     p->cut_window_sec = 3.0f;
     p->stream_chunk_sec = 2.0f;
-    /* Two attention blocks of context, so a committed frame has seen a full
-     * block behind it even at the window's left edge. */
+    /* Keep two attention blocks of context around the committed frontier. */
     p->stream_window_sec = 2.0f * GRANITE_BLOCK_SECONDS;
     p->stream_lookahead_sec = 1.6f;
 }
 
-/* ========================================================================
- * Growable output string
- * ======================================================================== */
 
 typedef struct {
     char *buf;
@@ -113,9 +104,6 @@ static int sb_append(strbuf_t *s, const char *text) {
     return 0;
 }
 
-/* ========================================================================
- * Segmented mode
- * ======================================================================== */
 
 /* Pick a cut near `target`, preferring the quietest 20 ms window within
  * +/- `radius` samples, so segment boundaries land in pauses rather than
@@ -199,9 +187,6 @@ char *granite_transcribe_segmented(granite_model_t *m, const float *samples,
     return out.buf;
 }
 
-/* ========================================================================
- * Streaming mode
- * ======================================================================== */
 
 static void argmax_frames(const float *logits, int n_frames, int *out) {
     for (int t = 0; t < n_frames; t++) {
@@ -230,14 +215,11 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
     if (chunk < spf) chunk = spf;
     if (window < chunk) window = chunk;
 
-    /* Per-frame argmax over the whole stream, indexed by absolute frame.
-     * Frames behind the lookahead are final; the rest get overwritten as the
-     * window slides, which is what keeps committed text stable. */
+    /* Store argmax results by absolute frame; only uncommitted frames change. */
     int *raw = NULL;
     int raw_cap = 0, committed = 0;
 
-    /* Block-aligning the window start rounds it down, so the span can exceed
-     * `window` by up to one block. Size the buffers for that. */
+    /* Rounding the start down can add one block to the window size. */
     int win_max = window + GRANITE_CONTEXT_SIZE * spf;
     float *win_buf = malloc((size_t)win_max * sizeof(float));
     int *ids = malloc((size_t)(win_max / spf + 8) * sizeof(int));
@@ -251,26 +233,17 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
     for (;;) {
         int avail = granite_live_audio_wait(la, want, &eof);
 
-        /* Advance the window end to whatever has arrived, but never far enough
-         * that its start would pass the committed frontier. Otherwise a fast
-         * producer (a pipe delivering the whole file at once) would leave the
-         * skipped span undecoded. With a backlog this strides window-at-a-time. */
+        /* Do not advance so far that the next window skips uncommitted audio. */
         int max_end = committed * spf + window;
         int end = avail < max_end ? avail : max_end;
         if (end <= win_end) {
-            /* No new audio. If more may still arrive, go back and wait; at EOF
-             * fall through once more so the trailing lookahead is released and
-             * the final frames get committed. The bottom-of-loop check then
-             * ends the loop, so this runs at most once. */
+            /* At EOF, make one final pass to release the trailing lookahead. */
             if (!eof) break;
         }
         win_end = end;
 
-        /* Align the window start to an attention-block boundary, not merely a
-         * frame boundary. Attention is block-local over GRANITE_CONTEXT_SIZE
-         * frames, so a start that is not block-aligned shifts the whole block
-         * grid relative to the previous window and re-decodes frames under
-         * different context, which is what produces boundary artifacts. */
+        /* Align windows to attention blocks so overlapping frames use the same
+         * block grid. */
         const int block_samples = GRANITE_CONTEXT_SIZE * spf;
         win_start = end - window;
         if (win_start < 0) win_start = 0;
@@ -298,33 +271,23 @@ char *granite_transcribe_stream(granite_model_t *m, granite_live_audio_t *la,
         }
         argmax_frames(logits, enc_frames, ids);
         granite_logits_free(logits);
-        /* Only write frames that are not yet committed. The window overlaps
-         * already-committed frames and re-decodes them under different context;
-         * letting those results land would mutate the committed prefix, so the
-         * collapsed text would stop being a pure extension of what was already
-         * emitted and the delta below would splice in duplicated fragments. */
+        /* Never overwrite committed frames: the sliding window re-decodes them. */
         for (int i = 0; i < enc_frames; i++) {
             int f = base + i;
             if (f >= committed) raw[f] = ids[i];
         }
 
-        /* Everything except the trailing lookahead is now stable. The lookahead
-         * only applies while more audio may still arrive for this span. */
+        /* Hold back the trailing lookahead while more audio may arrive. */
         int limit = base + enc_frames;
         if (!(eof && win_end >= avail)) {
             limit -= lookahead_frames;
-            /* Before a full attention block of audio exists, no frame has seen
-             * the context the model was trained with: the window's right edge
-             * is padding, not signal. Committing there bakes in artifacts that
-             * later windows cannot undo, so hold everything back. Clips shorter
-             * than a block therefore commit once, at EOF, matching offline. */
+            /* Do not commit padded frames until a full attention block exists. */
             if (avail < GRANITE_CONTEXT_SIZE * spf) limit = 0;
         }
         if (limit > committed) committed = limit;
         if (committed < 0) committed = 0;
 
-        /* CTC-collapse the committed prefix. Since committed frames never
-         * change, this only ever extends the previous decode. */
+        /* Collapse the stable prefix; it can only extend the emitted text. */
         int *collapsed = malloc((size_t)committed * sizeof(int));
         if (!collapsed) break;
         int n_ids = 0, prev = -1;

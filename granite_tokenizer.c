@@ -1,6 +1,4 @@
-/*
- * granite_tokenizer.c - Decode-only BPE tokenizer for Granite Speech 5.0
- */
+/* Decode-only tokenizer for Granite Speech 5.0 CTC output. */
 
 #include "granite_tokenizer.h"
 #include "granite.h"
@@ -15,11 +13,8 @@ struct granite_tokenizer {
     int vocab_size;
 };
 
-/* ------------------------------------------------------------------ JSON --- */
 
-/* Decode a JSON string literal starting at *p (which points just past the
- * opening quote). Writes into `out` (caller-sized >= the literal length) and
- * advances *p past the closing quote. Returns the byte length written. */
+/* Unescape a JSON string and advance p past its closing quote. */
 static int json_unescape(const char **p, char *out) {
     const char *s = *p;
     int n = 0;
@@ -84,9 +79,7 @@ static int json_unescape(const char **p, char *out) {
     return n;
 }
 
-/* Find the `"vocab":` object that lives inside `"model":`. The file also has a
- * top-level "added_tokens" array but no other "vocab" key, so the last match is
- * unambiguous; we search from the "model" key to be safe. */
+/* Find the vocab object inside the model object. */
 static const char *find_vocab(const char *json) {
     const char *model = strstr(json, "\"model\"");
     const char *from = model ? model : json;
@@ -131,8 +124,7 @@ granite_tokenizer_t *granite_tokenizer_load(const char *path) {
         granite_tokenizer_free(t); free(json); return NULL;
     }
 
-    /* Entries are `"token": id` pairs; a token is never longer than the raw
-     * literal, so the literal length is a safe scratch bound. */
+    /* The unescaped token fits within its JSON literal. */
     char *scratch = malloc((size_t)size);
     if (!scratch) { granite_tokenizer_free(t); free(json); return NULL; }
 
