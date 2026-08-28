@@ -529,9 +529,9 @@ void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
      * dispatch, or if an operand could not be resolved to a device buffer.
      *
      * The bias stays inside the Metal path (prefilled into C, beta=1) rather
-     * than moving to add_bias_rows like the BLAS path below. That is not a
-     * missed cleanup: the prefill is load-bearing. It is the CPU touching every
-     * page of the result before the GPU writes it, and without it the CPU reads
+     * than moving to add_bias_rows like the BLAS path below. Leave it. The
+     * prefill is the CPU touching every page of the result before the GPU
+     * writes it, and without it the CPU reads
      * back stale contents for part of the output, silently, with the command
      * buffer reporting success. It only shows up once a buffer lands on
      * recycled rather than fresh (zero-filled) pages, so a whole-clip decode
@@ -836,8 +836,8 @@ typedef struct {
 } attn_args_t;
 
 /*
- * Query blocking (QBLK): this kernel is bound by dependency-chain latency, not
- * by flops. One query row against one key is a 128-element dot reduced into a
+ * Query blocking (QBLK). The flops here are trivial; the latency is the
+ * problem. One query row against one key is a 128-element dot reduced into a
  * single NEON accumulator, a 32-long chain of 4-cycle FMAs that uses one of the
  * four FMA pipes. Measured, the whole kernel ran at ~53 GFLOP/s while
  * Accelerate's sgemm reaches ~1000 on the same machine.

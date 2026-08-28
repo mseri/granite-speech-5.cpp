@@ -1,234 +1,172 @@
 # granite.cpp
 
-Pure C inference for [IBM Granite Speech 5.0](https://huggingface.co/ibm-granite),
-a 473M-parameter CTC conformer speech-to-text model. No PyTorch, no ONNX, no
-runtime dependencies beyond libc, pthreads and a BLAS.
+`granite.cpp` is a lightweight, pure C inference engine for [IBM Granite Speech 5.0](https://huggingface.co/ibm-granite), a 473M-parameter CTC conformer speech-to-text model.
 
-Companion to [`qwen-asr`](../qwen-asr), which does the same for Qwen3-ASR.
+It runs locally with minimal dependencies (standard C library, POSIX threads, and a BLAS library), with no Python runtime, PyTorch, or ONNX needed for inference.
 
-## Build
+### Key Characteristics
+- **Architecture**: Encoder-only Conformer with 16 blocks (blocks 0 and 1 subsample 2x each in time, yielding 80 ms per encoder frame).
+- **Decoding**: Greedy CTC collapse (no autoregressive decoder, no KV cache, no sampling).
+- **Output format**: Always lowercase and unpunctuated, reflecting the model's 16,384-token vocabulary.
+- **Hardware backends**: CPU (NEON / generic C with BLAS) and an optional Apple Silicon Metal/MPS backend.
+
+---
+
+## Quick Start & Usage
+
+### 1. Download Model Files
+
+You need `model.safetensors` and `tokenizer.json` from the IBM Granite Speech 5.0 repository:
 
 ```sh
-make blas          # Accelerate on macOS, OpenBLAS on Linux
-make mps           # Metal/MPS on Apple Silicon
+# Example using huggingface-cli:
+huggingface-cli download ibm-granite/granite-speech-5.0 \
+  model.safetensors tokenizer.json \
+  --local-dir ./granite-speech-5.0
 ```
 
-`mps` is a superset of `blas`: it keeps BLAS for the shapes too small to be
-worth a GPU dispatch, and falls back to it wholesale if no Metal device is
-available. See [Backends](#backends).
+### 2. Transcribing Audio Files
 
-## Run
+Audio input must be 16-bit PCM (WAV format, or raw mono via standard input). 16 kHz mono is recommended.
 
 ```sh
-./granite -d granite-speech-5.0 -i audio.wav
+# Transcribe a single file (whole-clip offline mode)
+./granite -d granite-speech-5.0 -i samples/jfk.wav
 ```
 
-```
-$ ./granite -d granite-speech-5.0 -i samples/jfk.wav
+Output:
+```text
 and so my fellow americans ask not what your country can do for you ask what you can do for your country
 load 0.01s | audio 11.00s | infer 0.62s | RTF 0.057
 ```
 
-Audio can also come from stdin, as either a WAV stream or raw s16le 16 kHz mono:
-
+You can also pipe audio via stdin:
 ```sh
-cat audio.wav | ./granite -d granite-speech-5.0 --stdin
+cat samples/jfk.wav | ./granite -d granite-speech-5.0 --stdin
 ```
 
-### Streaming
+### 3. Real-Time Streaming & Segmented Modes
 
-`--stream` decodes incrementally, printing text as it stabilizes:
+#### Streaming Mode (`--stream`)
+Decodes audio incrementally from stdin (e.g. microphone capture), emitting stable text without waiting for the full recording to finish:
 
 ```sh
+# Linux (ALSA)
 arecord -f S16_LE -r 16000 -c 1 | ./granite -d granite-speech-5.0 --stream
+
+# macOS (sox)
+rec -t raw -r 16000 -c 1 -b 16 -e signed-integer - | ./granite -d granite-speech-5.0 --stream
 ```
 
-It re-encodes a sliding window and commits only frames that are settled, so
-emitted text is never retracted. Output starts once ~10 s of audio has arrived
-(see *Chunked decoding* below) and then follows with ~1.6 s of latency.
-
-### Segmented
-
-`-S <secs>` decodes long files in independent pieces, moving each cut to the
-quietest point within `-W` seconds so boundaries land in pauses:
+#### Segmented Processing (`-S <seconds>`)
+For long audio recordings (lectures, podcasts), segmented decoding processes the file in chunks while automatically snapping cut boundaries to quiet pauses:
 
 ```sh
 ./granite -d granite-speech-5.0 -i lecture.wav -S 30
 ```
 
-This avoids a single huge logits allocation (one contiguous
-`frames × 16384` float buffer, ~1.4 GB per 30 minutes). It does not lower peak
-RSS; the weight cache dominates that.
+### 4. CLI Options Reference
 
-### Options
+| Option | Description | Default |
+| --- | --- | --- |
+| `-d, --model-dir DIR` | Path to directory containing `model.safetensors` and `tokenizer.json` | `.` |
+| `-i, --input FILE` | Path to input 16-bit PCM WAV file | — |
+| `--stdin` | Read WAV or raw s16le (16 kHz mono) from stdin | — |
+| `-S, --segment SECS` | Process audio in chunks of ~N seconds (`0` = entire file at once) | `0` |
+| `-W, --cut-window SECS` | Search window around chunk boundary to find the quietest pause point | `3.0` |
+| `--stream` | Incremental low-latency stream decoding (implies `--stdin`) | disabled |
+| `--stream-chunk SECS` | Audio step interval between partial decodes | `2.0` |
+| `--stream-window SECS` | Re-encoded sliding window context | `20.5` |
+| `--stream-lookahead SECS` | Audio withheld from commit to ensure stability | `1.6` |
+| `-t, --threads N` | Number of worker threads | CPU core count |
+| `--silent` | Silence progress and runtime stats on stderr (stdout transcription remains) | disabled |
+| `--debug` | Print verbose timing, memory usage, and weight cache statistics | disabled |
+| `--weight-cache MB` | Maximum RAM allocated for bf16→f32 converted weights (`0` to disable caching) | `3072` |
+| `--dump DIR` | Dump raw intermediate tensors (`feats.bin`, `logits.bin`) for parity testing | disabled |
 
-| Flag | Meaning |
-| --- | --- |
-| `-d, --model-dir DIR` | directory with `model.safetensors` + `tokenizer.json` |
-| `-i, --input FILE` | 16-bit PCM WAV to transcribe |
-| `--stdin` | read WAV or raw s16le 16 kHz mono from stdin |
-| `-S, --segment SECS` | segmented decode (0 = whole clip, the default) |
-| `-W, --cut-window SECS` | search radius for a segment cut (default 3.0) |
-| `--stream` | incremental decode; implies `--stdin` |
-| `--stream-chunk SECS` | audio between decodes (default 2.0) |
-| `--stream-window SECS` | context re-encoded per decode (default 20.5) |
-| `--stream-lookahead SECS` | audio withheld from commit (default 1.6) |
-| `-t, --threads N` | worker threads (default: CPU count) |
-| `--silent` | quiet stderr; the transcription still goes to stdout |
-| `--debug` | verbose diagnostics, weight-cache and peak-RSS report |
-| `--weight-cache MB` | cap the bf16→f32 weight cache (default 3072) |
-| `--dump DIR` | write `feats.bin` / `logits.bin` for the parity harness |
+---
 
-## Model
+## Compilation
 
-The output is lowercase and unpunctuated. That is inherent to this model's
-16k-entry CTC vocabulary, not a limitation of this implementation.
+### Prerequisites
+- C11 compiler (`clang` or `gcc`)
+- `make`
+- A BLAS library:
+  - **macOS**: uses Apple Accelerate framework (built-in).
+  - **Linux**: requires OpenBLAS (`libopenblas-dev` on Debian/Ubuntu, `openblas-devel` on Fedora/RHEL).
 
-| | |
-| --- | --- |
-| Parameters | 473M, bf16 (946 MB) |
-| Front-end | 16 kHz → STFT(512/400/160) → 80 mel → +deltas → stack 2 → 320 dims |
-| Encoder | `input_linear` 320→1024, 16 conformer blocks, CTC head 1024→16384 |
-| Subsampling | blocks 0 and 1 halve time (4× total) → 80 ms per encoder frame |
-| Attention | block-local, context 128, Shaw relative-position bias |
-| Decoding | greedy CTC, blank = id 0 |
-
-Unlike Qwen3-ASR there is no autoregressive decoder, KV cache, or sampling: one
-encoder pass produces all logits, and the transcript is a greedy collapse of
-their argmax.
-
-Each conformer block is
-`x += ½·FF1(x)` → `x += Attn(x)` → `x = Conv(x) + x` → `x += ½·FF2(x)` → `LayerNorm`,
-where the conv module uses Linear pointwise projections with GLU, a depthwise
-k=7 convolution, and BatchNorm. After block 8 the CTC head output is softmaxed
-and folded back in through `out_mid`.
-
-## Correctness
-
-`reference.py` is a self-contained PyTorch implementation built from the
-checkpoint's own tensor names, so it needs no `transformers`: Granite Speech 5.0
-ships as `transformers 5.16.0.dev0`, which is unreleased. It is the parity
-oracle, not part of the inference path.
+### Build Targets
 
 ```sh
-make test        # or: ./test_granite.py
+# CPU build (Accelerate on macOS, OpenBLAS on Linux)
+make blas
+
+# Apple Silicon GPU/MPS build (Metal Matrix Multiplication + CPU norms/attention)
+make mps
+
+# Run parity and test suite (requires Python 3 venv with torch/torchaudio/tokenizers)
+make test
+
+# Clean artifacts
+make clean
 ```
 
-The harness runs both implementations over real samples and a synthetic length
-sweep chosen to exercise the awkward shapes: a trailing attention block shorter
-than the 128-frame context, and odd frame counts hitting the subsampling trim.
+---
+
+## Streaming and Chunked Processing
+
+### The 10.24-Second Receptive Field
+
+Granite Speech 5.0 computes block-local self-attention over **128 encoder frames**. Because subsampling reduces the 10 ms audio frame rate to 80 ms per encoder frame, each attention block spans exactly:
+
+$$\text{Block size} = 128 \times 80\text{ ms} = 10.24\text{ seconds}$$
+
+A change in any audio sample only influences the logits within its 10.24 s attention block. Both streaming and segmented modes are built directly around this property.
+
+### How Modes Work
 
 ```
-    feats  max|d| = 4.554e-05 over 176000 values
-    logits max|d| = 1.788e-04 over 2244608 values; argmax 137/137 frames agree
-  PASS jfk.wav
+1. Offline (Whole Clip)
+   [==================== Full Audio ====================] -> Single Forward Pass -> CTC Greedy Collapse
+
+2. Segmented (-S 30)
+   [--- ~30s Block ---] cut at pause [--- ~30s Block ---] cut at pause [--- ~30s Block ---]
+       (Each segment decoded independently; prevents huge contiguous logits buffers on long audio)
+
+3. Streaming (--stream)
+   Sliding window re-encodes context across block boundaries:
+   Window 0: [====== Context ======|...lookahead...]
+                                   └── Commit settled tokens ──> emit to stdout
+   Window 1:         [====== Context ======|...lookahead...]
+                                           └── Commit settled tokens ──> emit to stdout
 ```
 
-Features match to ~1e-5 and logits to ~1e-4; argmax agrees on 100% of frames in
-every case, which is what determines the transcript.
+### Technical Invariants in Streaming
 
-## Chunked decoding
+- **Block-aligned sliding windows**: Streaming windows always start on an attention block boundary (multiples of 10.24 s). Aligning windows to arbitrary frame boundaries shifts the attention grid and increases word error rate (WER).
+- **Lookahead buffer**: The trailing `1.6 s` (`--stream-lookahead`) of the active window is held uncommitted until the next step arrives, avoiding boundary distortions caused by edge padding.
+- **Stable prefix commits**: Tokens are committed incrementally once they move past the lookahead horizon. Already-committed frames are never re-evaluated or overwritten, ensuring text is emitted monotonically with zero flickering or rollbacks.
+- **Segmented cutting**: In `-S` mode, chunk splits are placed at local energy minima within `-W` seconds to avoid severing words mid-phoneme.
 
-Attention is block-local over 128 encoder frames, and a frame is 80 ms, so the
-model's effective receptive field is one attention block, about 10.2 s. Measured
-directly: perturbing 10 ms of audio changes logits across exactly frames 0 to 127
-of its block, and only weakly beyond. Everything about chunking follows from
-that number.
+---
 
-- Segments below 10.2 s are clamped up to it.
-- Streaming windows start on block boundaries, not merely frame boundaries.
-  Aligning only to frames shifts the whole block grid between windows and was
-  worth ~1.8% WER.
-- Nothing is committed until a full block of audio exists; before that the
-  window's right edge is padding rather than signal.
-
-Cost of chunking, measured against the whole-clip decode:
-
-| Audio | `-S 30` | `--stream` |
-| --- | --- | --- |
-| 11s / 3.6s samples | 0.00% | 0.00% |
-| 119s real speech | 2.21% | 0.44% |
-| 10 min | not measured | 0.61% |
-
-Streaming tracks offline more closely than segmented because it re-decodes
-overlapping context and commits only settled frames, where segmented decodes
-disjoint pieces and concatenates. Against *ground truth* on the 119 s sample all
-three modes are equivalent (offline 18.1%, stream and segment 17.2%), so
-chunking costs no real accuracy.
-
-## Performance
-
-Apple Silicon, `make blas`, 8 threads, model file warm in the page cache:
-
-| Audio | Inference | RTF |
-| --- | --- | --- |
-| 3.6s | 0.41s | 0.114 |
-| 11s | 0.62s | 0.057 |
-| 66s | 2.24s | 0.034 |
-
-Roughly 9x to 29x realtime, improving with clip length as fixed costs amortize.
-A 10-minute file decodes in ~20 s (RTF 0.033).
-
-Peak RSS is ~2.4 GB by default, dominated by the bf16→f32 weight cache;
-`--weight-cache 0` drops that to ~1.3 GB by reconverting weights per call.
-Neither `-S` nor `--stream` reduces peak RSS meaningfully, since the weights
-dominate: measured 3.0 GB whole-clip against 3.1 GB segmented on 30 minutes.
-
-## Backends
-
-| | `make blas` | `make mps` |
-| --- | --- | --- |
-| Linears | `cblas_sgemm` | `MPSMatrixMultiplication` |
-| Block attention | NEON + thread pool | NEON + thread pool |
-| Norms, GLU, SiLU, depthwise conv | CPU | CPU |
-| Platforms | macOS, Linux | macOS on Apple Silicon |
-
-The MPS backend allocates the weight cache and every encoder scratch buffer as
-Metal shared buffers, so the GPU reads the same bytes the CPU wrote. Operands
-are never uploaded per call and the 1.8 GB weight cache is not duplicated on the
-device. That is the point of the design; without it the device would need its
-own second copy.
-
-It still costs some memory, measured on an M1:
-
-| Peak RSS | 11s clip | 119s clip |
-| --- | --- | --- |
-| `make blas` | 2242 MB | 2506 MB |
-| `make mps` | 2767 MB | 2690 MB |
-
-The 180 to 525 MB of overhead is per-buffer page rounding across the ~390 weight
-allocations, MPS internal workspaces, and the staging slots. The MPS build is
-not memory-neutral.
-
-Only the linears go to the GPU. Norms and elementwise ops stay on the CPU
-because each would cost a dispatch round-trip to save very little, and attention
-stays there because it was tried: a hand-written shader measured 1.00 s against
-the CPU kernel's 0.27 s over a 119 s clip, so it was removed. Under `--debug`
-the backend reports the device it selected:
+## Project Structure
 
 ```
-$ ./granite -d granite-speech-5.0 -i audio.wav --debug
-[metal] using device: Apple M2 Pro
+granite.cpp/
+├── main.c                  # CLI entrypoint and argument parsing
+├── granite.c               # High-level pipeline and orchestration
+├── granite.h               # Public C API and model structures
+├── granite_encoder.c       # Conformer encoder forward pass & layer logic
+├── granite_kernels.c       # Thread pool, GEMM bindings, NEON attention, norms, conv
+├── granite_kernels_metal.m # Metal/MPS shared-buffer GEMM backend
+├── granite_audio.c         # WAV parsing, STFT, Hann window, mel filterbanks
+├── granite_tokenizer.c     # Decode-only BPE tokenizer
+├── granite_safetensors.c   # Fast mmap-based safetensors loader
+├── reference.py            # PyTorch reference implementation for parity checks
+└── test_granite.py         # Test suite comparing C output vs reference implementation
 ```
-
-If that line is absent on an `mps` build, the run went to BLAS.
-
-## Layout
-
-| File | Contents |
-| --- | --- |
-| `main.c` | CLI |
-| `granite.c` | model load/free, end-to-end transcription |
-| `granite_encoder.c` | conformer forward pass, weight binding |
-| `granite_kernels.c` | thread pool, bf16 GEMM, norms, attention, conv |
-| `granite_kernels_metal.m` | Metal backend: shared buffers, MPS GEMM |
-| `granite_audio.c` | WAV I/O, FFT, mel filterbank, front-end |
-| `granite_tokenizer.c` | decode-only BPE (CTC never encodes text) |
-| `granite_safetensors.c` | mmap'd checkpoint reader (from `qwen-asr`) |
-| `reference.py` | PyTorch parity oracle |
-| `test_granite.py` | regression + parity harness |
-| `tools/stream_wer.py` | WER of a chunked mode against the offline decode |
 
 ## License
 
-Apache 2.0, matching the model.
+Apache 2.0.
