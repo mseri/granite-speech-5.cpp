@@ -394,6 +394,51 @@ static const float *bf16_as_f32(const uint16_t *src, size_t n) {
     return out;
 }
 
+#ifdef USE_BLAS
+/* Concatenated [3*out_dim, in_dim] f32 weights for a fused Q/K/V GEMM, cached
+ * by the Q weight's stable pointer (one entry per attention layer). */
+#define FUSED_CACHE_MAX 64
+
+typedef struct {
+    const uint16_t *key;
+    float *f32;
+} fused_entry_t;
+
+static struct {
+    fused_entry_t entries[FUSED_CACHE_MAX];
+    int count;
+    pthread_mutex_t mutex;
+} fused_cache = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+
+static const float *fused_bf16_as_f32_x3(const uint16_t *W0, const uint16_t *W1,
+                                         const uint16_t *W2, int out_dim, int in_dim) {
+    pthread_mutex_lock(&fused_cache.mutex);
+    for (int i = 0; i < fused_cache.count; i++) {
+        if (fused_cache.entries[i].key == W0) {
+            const float *hit = fused_cache.entries[i].f32;
+            pthread_mutex_unlock(&fused_cache.mutex);
+            return hit;
+        }
+    }
+    if (fused_cache.count >= FUSED_CACHE_MAX) {
+        pthread_mutex_unlock(&fused_cache.mutex);
+        return NULL;
+    }
+    size_t n = (size_t)out_dim * in_dim;
+    float *buf = malloc(3 * n * sizeof(float));
+    if (buf) {
+        bf16_to_f32_buf(buf,         W0, n);
+        bf16_to_f32_buf(buf + n,     W1, n);
+        bf16_to_f32_buf(buf + 2 * n, W2, n);
+        fused_cache.entries[fused_cache.count].key = W0;
+        fused_cache.entries[fused_cache.count].f32 = buf;
+        fused_cache.count++;
+    }
+    pthread_mutex_unlock(&fused_cache.mutex);
+    return buf;
+}
+#endif
+
 
 /* Add one bias row to every frame of a GEMM result. */
 typedef struct {
@@ -432,6 +477,31 @@ static void add_bias_rows(float *y, const float *bias, int seq, int out_dim) {
     bias_args_t a = { y, bias, seq, out_dim };
     parallel_for(bias_worker, &a);
 }
+
+#ifdef USE_BLAS
+/* Split a fused [seq, 3*out_dim] GEMM result into three [seq, out_dim] buffers. */
+typedef struct {
+    float *y0, *y1, *y2;
+    const float *concat;
+    int seq, out_dim;
+} split3_args_t;
+
+static void split3_worker(int tid, int n_threads, void *arg) {
+    split3_args_t *a = arg;
+    int per = (a->seq + n_threads - 1) / n_threads;
+    int start = tid * per;
+    int end = start + per;
+    if (end > a->seq) end = a->seq;
+
+    size_t od = (size_t)a->out_dim;
+    for (int t = start; t < end; t++) {
+        const float *row = a->concat + (size_t)t * 3 * od;
+        memcpy(a->y0 + (size_t)t * od, row,          od * sizeof(float));
+        memcpy(a->y1 + (size_t)t * od, row + od,     od * sizeof(float));
+        memcpy(a->y2 + (size_t)t * od, row + 2 * od, od * sizeof(float));
+    }
+}
+#endif
 
 #ifndef USE_BLAS
 typedef struct {
@@ -521,6 +591,27 @@ void granite_linear3_bf16(float *y0, float *y1, float *y2, const float *x,
         granite_metal_linear3(y0, y1, y2, x, Wf0, Wf1, Wf2, seq, in_dim, out_dim))
         return;
 #endif
+
+#ifdef USE_BLAS
+    /* One [seq, in_dim] x [in_dim, 3*out_dim] GEMM beats three separate
+     * [seq, in_dim] x [in_dim, out_dim] ones: same total FLOPs, but Accelerate
+     * reuses each loaded x tile across 3x the output columns instead of
+     * re-streaming x from memory three times, and pays thread-dispatch
+     * overhead once instead of three times. */
+    const float *Wcat = fused_bf16_as_f32_x3(W0, W1, W2, out_dim, in_dim);
+    float *concat = Wcat ? malloc((size_t)seq * 3 * out_dim * sizeof(float)) : NULL;
+    if (concat) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    seq, 3 * out_dim, in_dim, 1.0f,
+                    x, in_dim, Wcat, in_dim,
+                    0.0f, concat, 3 * out_dim);
+        split3_args_t sa = { y0, y1, y2, concat, seq, out_dim };
+        parallel_for(split3_worker, &sa);
+        free(concat);
+        return;
+    }
+#endif
+
     granite_linear_bf16(y0, x, W0, NULL, seq, in_dim, out_dim);
     granite_linear_bf16(y1, x, W1, NULL, seq, in_dim, out_dim);
     granite_linear_bf16(y2, x, W2, NULL, seq, in_dim, out_dim);
