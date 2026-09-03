@@ -1,4 +1,6 @@
-/* Metal/MPS backend. Shared buffers let GEMMs use cached weights in place. */
+/* Metal/MPS backend. Shared buffers let GEMMs use cached weights in place;
+ * on a discrete GPU the driver still keeps that memory coherent, just over
+ * PCIe instead of a unified pool, so no code path here needs to change. */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

@@ -1,4 +1,4 @@
-/* C interface to the Apple Silicon Metal/MPS backend. */
+/* C interface to the Metal/MPS backend. */
 
 #ifndef GRANITE_KERNELS_METAL_H
 #define GRANITE_KERNELS_METAL_H
@@ -34,7 +34,8 @@ int granite_metal_dealloc(void *p);
 
 
 /* 1 when a seq x in_dim x out_dim linear is worth a GPU dispatch. Small
- * matrices lose to dispatch latency even on unified memory. */
+ * matrices lose to dispatch latency; on a discrete GPU the PCIe copy of
+ * staged operands raises that bar further. */
 int granite_metal_should_offload(int seq, int in_dim, int out_dim);
 
 

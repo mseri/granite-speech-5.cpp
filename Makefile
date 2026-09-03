@@ -1,7 +1,8 @@
 # granite.cpp — Granite Speech 5.0 pure C CTC inference
 #
-# Two build shapes: CPU with BLAS, and Metal/MPS on Apple Silicon. The MPS build
-# is a superset — it keeps BLAS for the shapes too small to be worth a dispatch.
+# Two build shapes: CPU with BLAS, and Metal/MPS on any Mac with a Metal GPU
+# (Apple Silicon or Intel). The MPS build is a superset — it keeps BLAS for
+# the shapes too small to be worth a dispatch.
 
 CC = clang
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native
@@ -25,7 +26,7 @@ help:
 	@echo "granite.cpp — Granite Speech 5.0 pure C inference"
 	@echo ""
 	@echo "  make blas    - build with BLAS (Accelerate on macOS, OpenBLAS on Linux)"
-	@echo "  make mps     - build with the Metal/MPS backend (Apple Silicon)"
+	@echo "  make mps     - build with the Metal/MPS backend (any Mac with Metal)"
 	@echo "  make debug   - debug build with AddressSanitizer"
 	@echo "  make test    - run the regression suite against reference.py"
 	@echo "  make clean   - remove build artifacts"
@@ -45,7 +46,7 @@ blas:
 # ---------------------------------------------------------------------- mps ---
 # Objective-C sources need -fobjc-arc; the registry in granite_kernels_metal.m
 # relies on ARC for its strong MTLBuffer references.
-ifeq ($(UNAME_S)/$(UNAME_M),Darwin/arm64)
+ifeq ($(UNAME_S),Darwin)
 mps: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_MPS -DACCELERATE_NEW_LAPACK
 mps: LDFLAGS += -framework Accelerate -framework Metal \
                 -framework MetalPerformanceShaders -framework Foundation
@@ -58,7 +59,7 @@ mps:
 	@echo "Built with the Metal/MPS backend"
 else
 mps:
-	@echo "Error: 'make mps' requires macOS on Apple Silicon" >&2
+	@echo "Error: 'make mps' requires macOS" >&2
 	@echo "  this machine is $(UNAME_S)/$(UNAME_M); use 'make blas'" >&2
 	@exit 1
 endif
