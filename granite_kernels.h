@@ -45,6 +45,14 @@ void granite_subsample_pool_add(float *out, const float *x, const float *proj,
 void granite_linear_bf16(float *y, const float *x, const uint16_t *W,
                          const uint16_t *b, int seq, int in_dim, int out_dim);
 
+/* Three bias-free linears sharing the same input x, e.g. Q/K/V projections.
+ * Equivalent to three granite_linear_bf16 calls but, under the Metal
+ * backend, dispatched as one command buffer instead of three round trips
+ * (a bigger win with a discrete GPU's PCIe latency than a unified-memory one). */
+void granite_linear3_bf16(float *y0, float *y1, float *y2, const float *x,
+                          const uint16_t *W0, const uint16_t *W1,
+                          const uint16_t *W2, int seq, int in_dim, int out_dim);
+
 
 /* LayerNorm over the last dim, with bf16 affine params. `out` may alias `x`. */
 void granite_layer_norm_bf16(float *out, const float *x, const uint16_t *w,

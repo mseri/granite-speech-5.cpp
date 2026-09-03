@@ -510,6 +510,22 @@ done:
     if (bias && bias != bias_stack) free(bias);
 }
 
+void granite_linear3_bf16(float *y0, float *y1, float *y2, const float *x,
+                          const uint16_t *W0, const uint16_t *W1,
+                          const uint16_t *W2, int seq, int in_dim, int out_dim) {
+#ifdef USE_MPS
+    const float *Wf0 = bf16_as_f32(W0, (size_t)in_dim * out_dim);
+    const float *Wf1 = bf16_as_f32(W1, (size_t)in_dim * out_dim);
+    const float *Wf2 = bf16_as_f32(W2, (size_t)in_dim * out_dim);
+    if (Wf0 && Wf1 && Wf2 && granite_metal_should_offload(seq, in_dim, out_dim) &&
+        granite_metal_linear3(y0, y1, y2, x, Wf0, Wf1, Wf2, seq, in_dim, out_dim))
+        return;
+#endif
+    granite_linear_bf16(y0, x, W0, NULL, seq, in_dim, out_dim);
+    granite_linear_bf16(y1, x, W1, NULL, seq, in_dim, out_dim);
+    granite_linear_bf16(y2, x, W2, NULL, seq, in_dim, out_dim);
+}
+
 
 typedef struct {
     float *out;

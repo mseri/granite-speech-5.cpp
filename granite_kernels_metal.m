@@ -296,3 +296,49 @@ int granite_metal_linear(float *y, const float *x, const float *W,
     if (!g_available) return 0;
     return metal_linear(y, x, W, bias, seq, in_dim, out_dim);
 }
+
+int granite_metal_linear3(float *y0, float *y1, float *y2, const float *x,
+                          const float *W0, const float *W1, const float *W2,
+                          int seq, int in_dim, int out_dim) {
+    granite_metal_init();
+    if (!g_available) return 0;
+
+    const size_t sx = (size_t)seq * in_dim * sizeof(float);
+    const size_t sW = (size_t)out_dim * in_dim * sizeof(float);
+    const size_t sy = (size_t)seq * out_dim * sizeof(float);
+
+    size_t ox, oW0, oW1, oW2, oy0, oy1, oy2;
+    id<MTLBuffer> bx  = operand(x,  sx, 0, /*copy_in=*/1, &ox);
+    id<MTLBuffer> bW0 = operand(W0, sW, 1, /*copy_in=*/1, &oW0);
+    id<MTLBuffer> by0 = operand(y0, sy, 2, /*copy_in=*/0, &oy0);
+    /* Slots 1/2 are the only staging buffers; a second and third weight or
+     * output needing staging would clobber the first. In practice weights
+     * and Q/K/V outputs are always resident (bf16_as_f32 cache and
+     * granite_device_alloc respectively), so this only ever guards against
+     * an unexpected caller. */
+    if (!bx || !bW0 || !by0) return 0;
+    id<MTLBuffer> bW1 = reg_find(W1, sW, &oW1);
+    id<MTLBuffer> bW2 = reg_find(W2, sW, &oW2);
+    id<MTLBuffer> by1 = reg_find(y1, sy, &oy1);
+    id<MTLBuffer> by2 = reg_find(y2, sy, &oy2);
+    if (!bW1 || (oW1 % 16) || !bW2 || (oW2 % 16) ||
+        !by1 || (oy1 % 16) || !by2 || (oy2 % 16))
+        return 0;
+
+    int slot = mm_slot(seq, in_dim, out_dim, 0);
+    MPSMatrix *mx  = [[MPSMatrix alloc] initWithBuffer:bx  offset:ox  descriptor:g_mm[slot].dx];
+    MPSMatrix *mW0 = [[MPSMatrix alloc] initWithBuffer:bW0 offset:oW0 descriptor:g_mm[slot].dW];
+    MPSMatrix *mW1 = [[MPSMatrix alloc] initWithBuffer:bW1 offset:oW1 descriptor:g_mm[slot].dW];
+    MPSMatrix *mW2 = [[MPSMatrix alloc] initWithBuffer:bW2 offset:oW2 descriptor:g_mm[slot].dW];
+    MPSMatrix *my0 = [[MPSMatrix alloc] initWithBuffer:by0 offset:oy0 descriptor:g_mm[slot].dy];
+    MPSMatrix *my1 = [[MPSMatrix alloc] initWithBuffer:by1 offset:oy1 descriptor:g_mm[slot].dy];
+    MPSMatrix *my2 = [[MPSMatrix alloc] initWithBuffer:by2 offset:oy2 descriptor:g_mm[slot].dy];
+
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    [g_mm[slot].mm encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mW0 resultMatrix:my0];
+    [g_mm[slot].mm encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mW1 resultMatrix:my1];
+    [g_mm[slot].mm encodeToCommandBuffer:cmd leftMatrix:mx rightMatrix:mW2 resultMatrix:my2];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return 1;
+}

@@ -174,9 +174,8 @@ static void attention(float *x, int T, scratch_t *s, const granite_layer_t *L,
 
     granite_layer_norm_bf16(s->norm, x, L->norm_att_w, L->norm_att_b,
                             T, GRANITE_HIDDEN, LN_EPS);
-    granite_linear_bf16(s->q, s->norm, L->q_w, NULL, T, GRANITE_HIDDEN, inner);
-    granite_linear_bf16(s->k, s->norm, L->k_w, NULL, T, GRANITE_HIDDEN, inner);
-    granite_linear_bf16(s->v, s->norm, L->v_w, NULL, T, GRANITE_HIDDEN, inner);
+    granite_linear3_bf16(s->q, s->k, s->v, s->norm, L->q_w, L->k_w, L->v_w,
+                         T, GRANITE_HIDDEN, inner);
 
     int nb_full = T / c;
     int nr = T % c;

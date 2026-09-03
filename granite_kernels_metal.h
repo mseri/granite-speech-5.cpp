@@ -51,4 +51,12 @@ int granite_metal_should_offload(int seq, int in_dim, int out_dim);
 int granite_metal_linear(float *y, const float *x, const float *W,
                          const float *bias, int seq, int in_dim, int out_dim);
 
+/* Same math as three granite_metal_linear calls with bias=NULL and a shared
+ * x, but encoded into one command buffer so there is a single commit/wait
+ * round trip instead of three. Returns 1 if all three were computed on the
+ * GPU, 0 if the caller must fall back (no partial results are written). */
+int granite_metal_linear3(float *y0, float *y1, float *y2, const float *x,
+                          const float *W0, const float *W1, const float *W2,
+                          int seq, int in_dim, int out_dim);
+
 #endif
