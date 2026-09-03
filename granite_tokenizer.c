@@ -179,27 +179,57 @@ int granite_tokenizer_vocab_size(const granite_tokenizer_t *t) {
     return t ? t->vocab_size : 0;
 }
 
-/* `<0xHH>` byte-fallback pieces decode to the raw byte HH. */
-static int byte_fallback(const char *piece, int len, unsigned char *out) {
-    if (len != 6 || piece[0] != '<' || piece[1] != '0' || piece[2] != 'x' ||
-        piece[5] != '>')
-        return 0;
-    unsigned v = 0;
-    for (int i = 3; i <= 4; i++) {
-        char c = piece[i];
-        v <<= 4;
-        if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
-        else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
-        else return 0;
+/*
+ * GPT-2 byte-level BPE maps every raw byte to a unicode codepoint (see
+ * `bytes_to_unicode` in HF's tokenizers): printable ASCII/Latin-1 bytes map
+ * to themselves, and the rest (control chars, space, etc.) map to codepoints
+ * starting at U+0100. Notably 0x20 (space) maps to U+0120 ('Ġ'). Vocab
+ * pieces are therefore UTF-8 encodings of those codepoints, not raw text,
+ * and must be mapped back through the inverse table to recover the bytes.
+ */
+static short g_byte_of_cp[512];
+static int g_table_built = 0;
+
+static void build_byte_unicode_table(void) {
+    unsigned short cp_of_byte[256];
+    int assigned[256] = {0};
+    for (int b = 33; b <= 126; b++) { cp_of_byte[b] = (unsigned short)b; assigned[b] = 1; }
+    for (int b = 161; b <= 172; b++) { cp_of_byte[b] = (unsigned short)b; assigned[b] = 1; }
+    for (int b = 174; b <= 255; b++) { cp_of_byte[b] = (unsigned short)b; assigned[b] = 1; }
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        if (!assigned[b]) {
+            cp_of_byte[b] = (unsigned short)(256 + n);
+            n++;
+        }
     }
-    *out = (unsigned char)v;
-    return 1;
+    for (int i = 0; i < 512; i++) g_byte_of_cp[i] = -1;
+    for (int b = 0; b < 256; b++) g_byte_of_cp[cp_of_byte[b]] = (short)b;
+    g_table_built = 1;
+}
+
+/* Decode one UTF-8 codepoint from `s`, writing its length to *adv. */
+static unsigned decode_utf8_cp(const char *s, int remaining, int *adv) {
+    unsigned char c0 = (unsigned char)s[0];
+    if (c0 < 0x80) { *adv = 1; return c0; }
+    if ((c0 & 0xE0) == 0xC0 && remaining >= 2) {
+        *adv = 2;
+        return ((unsigned)(c0 & 0x1F) << 6) | ((unsigned)(unsigned char)s[1] & 0x3F);
+    }
+    if ((c0 & 0xF0) == 0xE0 && remaining >= 3) {
+        *adv = 3;
+        return ((unsigned)(c0 & 0x0F) << 12) |
+               (((unsigned)(unsigned char)s[1] & 0x3F) << 6) |
+               ((unsigned)(unsigned char)s[2] & 0x3F);
+    }
+    *adv = 1;
+    return c0;
 }
 
 char *granite_tokenizer_decode(const granite_tokenizer_t *t,
                                const int *ids, int n_ids) {
     if (!t) return NULL;
+    if (!g_table_built) build_byte_unicode_table();
 
     size_t cap = 256, len = 0;
     char *out = malloc(cap);
@@ -218,21 +248,12 @@ char *granite_tokenizer_decode(const granite_tokenizer_t *t,
             out = nb;
         }
 
-        unsigned char b;
-        if (byte_fallback(piece, plen, &b)) {
-            out[len++] = (char)b;
-            continue;
-        }
-        /* Replace U+2581 (E2 96 81) with a space. */
-        for (int j = 0; j < plen; j++) {
-            if (j + 2 < plen && (unsigned char)piece[j] == 0xE2 &&
-                (unsigned char)piece[j + 1] == 0x96 &&
-                (unsigned char)piece[j + 2] == 0x81) {
-                out[len++] = ' ';
-                j += 2;
-            } else {
-                out[len++] = piece[j];
-            }
+        for (int j = 0; j < plen; ) {
+            int adv;
+            unsigned cp = decode_utf8_cp(piece + j, plen - j, &adv);
+            short b = cp < 512 ? g_byte_of_cp[cp] : -1;
+            out[len++] = (char)(b >= 0 ? (unsigned char)b : (unsigned char)cp);
+            j += adv;
         }
     }
 
